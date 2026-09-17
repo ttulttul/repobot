@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+  <title>Repobot menu bar glyph</title>
+  <desc>A solid branching arrow, drawn for a 22-point template image with an 18 by 16-point visual footprint.</desc>
+  <path fill="#000000" d="
+    M 4.1 6.9
+    L 7.4 10.2
+    C 9 11.8 9.75 13.4 9.75 15.3
+    V 17.75
+    Q 9.75 19 11 19
+    Q 12.25 19 12.25 17.75
+    V 15.3
+    C 12.25 13.4 13 11.8 14.6 10.2
+    L 17.9 6.9
+    L 19.2 8.2
+    Q 20 9 20 7.9
+    V 3.75
+    Q 20 3 19.25 3
+    H 15.1
+    Q 14 3 14.8 3.8
+    L 16.1 5.1
+    L 12.8 8.4
+    Q 11.5 9.7 11 11.2
+    Q 10.5 9.7 9.2 8.4
+    L 5.9 5.1
+    L 7.2 3.8
+    Q 8 3 6.9 3
+    H 2.75
+    Q 2 3 2 3.75
+    V 7.9
+    Q 2 9 2.8 8.2
+    Z"/>
+</svg>
