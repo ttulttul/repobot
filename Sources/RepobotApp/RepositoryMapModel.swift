@@ -180,6 +180,12 @@ struct RepositoryMapMachine {
   var focusSearch = false
   var search = "" { didSet { if search != oldValue { filter() } } }
   var sharedOnly = false { didSet { if sharedOnly != oldValue { filter() } } }
+  /// Finds container repositories (an atlas, a mirror farm) so their nested copies can be excluded.
+  var nestedOnly = false { didSet { if nestedOnly != oldValue { filter() } } }
+  /// Copies already set not to explore nested repositories; they no longer have visible children.
+  var nestedSkipped: Set<String> = [] { didSet { if nestedSkipped != oldValue && nestedOnly { filter() } } }
+  /// Clone ID → number of monitored repositories beneath it on the same machine.
+  private(set) var nestedCounts: [String: Int] = [:]
   private(set) var notificationCloneIDs: Set<String>?
   var selectedGroupID: String?
   var selectedGroup: RepositoryMapGroup? { visibleGroups.first { $0.id == selectedGroupID } }
@@ -235,6 +241,19 @@ struct RepositoryMapMachine {
       structuralChange = true
     }
     if structuralChange {
+      var byMachine: [UUID: [String: String]] = [:]
+      for row in rows.values { byMachine[row.clone.environmentID, default: [:]][row.clone.repo.path] = row.id }
+      var counts: [String: Int] = [:]
+      for paths in byMachine.values {
+        for path in paths.keys {
+          var ancestor = (path as NSString).deletingLastPathComponent
+          while ancestor.count > 1 {
+            if let id = paths[ancestor] { counts[id, default: 0] += 1 }
+            ancestor = (ancestor as NSString).deletingLastPathComponent
+          }
+        }
+      }
+      if counts != nestedCounts { nestedCounts = counts }
       groupingCount += 1
       let membership = Dictionary(grouping: rows.values, by: \.groupID)
       for id in Set(groups.keys).subtracting(membership.keys) { groups[id] = nil }
@@ -260,13 +279,14 @@ struct RepositoryMapMachine {
         return $0.id.localizedStandardCompare($1.id) == .orderedAscending
       }
     }
-    if sortNeeded || (!search.isEmpty && !dirty.isEmpty) { filter() }
+    if sortNeeded || ((!search.isEmpty || nestedOnly) && !dirty.isEmpty) { filter() }
     revision = world.analysisRevision; initialized = true
     snapshotSource = stamp?.source; snapshotRevision = stamp?.revision
   }
   func show(cloneIDs: Set<String>) {
     search = ""
     sharedOnly = false
+    nestedOnly = false
     notificationCloneIDs = cloneIDs
     filter()
   }
@@ -276,6 +296,7 @@ struct RepositoryMapMachine {
     let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
     let next = ordered.filter { group in
       (!sharedOnly || group.machineCount > 1) && group.matches(query)
+        && (!nestedOnly || group.rows.contains { nestedCounts[$0.id] != nil || nestedSkipped.contains($0.id) })
         && (notificationCloneIDs.map { ids in group.rows.contains { ids.contains($0.id) } } ?? true)
     }
     if next.map(\.id) != visibleGroups.map(\.id) { visibleGroups = next }

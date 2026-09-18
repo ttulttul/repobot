@@ -202,7 +202,8 @@ public actor EnvironmentMonitor {
         }
       var rediscovered = false
       if forceDiscovery || Date().timeIntervalSince(discovered) > 600 {
-        paths = try await Probe.discover(roots: environment.roots, using: transport)
+        paths = try await Probe.discover(
+          roots: environment.roots, containers: configuration.containerPaths(in: environment.id), using: transport)
         discovered = Date()
         forceDiscovery = false
         rediscovered = true

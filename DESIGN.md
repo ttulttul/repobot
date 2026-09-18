@@ -281,6 +281,11 @@ Details for the event tiers:
   chosen coding agent interactively in Terminal (in the repository, or with SSH details for a
   remote) with that evidence. The agent may only propose `.gitignore` edits and must show the diff
   before writing. A changed `.gitignore` emits `RESET`, so coverage is recomputed at once.
+- **Container repositories.** A repository can be marked "Don't explore repositories inside this
+  one" (Repo Detail; off by default, stored per clone in `nestedRepositoriesSkipped`). Discovery
+  then reports the repository itself but nothing beneath it, pruned on the host by `discover.sh`
+  so an atlas or mirror farm cannot crowd out real work within the 500-per-root cap. Without the
+  setting, a nested checkout is treated as work in its own right.
 - **Hiding idle repositories.** `hideIdleRepositories` (default on) leaves repositories out of the
   menu when no branch has a commit and no working file is newer than `watchActiveDays`, judged
   on the repository's own machine clock. Anything at attention or problem severity is always

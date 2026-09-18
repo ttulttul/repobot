@@ -97,6 +97,20 @@ struct RepoDetailView: View {
               }
             }
           }
+          let nested = state.world.clones.filter {
+            $0.environmentID == clone.environmentID && $0.repo.path.hasPrefix(clone.repo.path + "/")
+          }.count
+          if nested > 0 || state.configuration.skipsNestedRepositories(clone.id) {
+            Toggle(isOn: Binding(get: { state.configuration.skipsNestedRepositories(clone.id) },
+                                 set: { state.setSkipsNestedRepositories($0, for: clone) })) {
+              VStack(alignment: .leading, spacing: 2) {
+                Text("Don’t explore repositories inside this one")
+                Text(nested > 0 ? "\(nested) nested \(nested == 1 ? "repository is" : "repositories are") currently monitored as separate work."
+                     : "Repositories beneath this folder are not monitored.")
+                  .font(.caption).foregroundStyle(.secondary)
+              }
+            }
+          }
           HStack {
             Button("Repository Map…") { state.showRepositoryMap() }
             Button("Ask an agent about these copies…") { state.showAgentReview(clone.status.identity) }

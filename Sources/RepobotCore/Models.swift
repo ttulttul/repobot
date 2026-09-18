@@ -253,6 +253,15 @@ public struct Configuration: Codable, Sendable, Equatable {
   public var watchActiveDays: Double? = nil
   public var watchSkipNames: [String]? = nil
   public var hideIdleRepositories: Bool? = nil
+  /// Clone IDs of repositories whose nested repositories are not explored. Off per repository
+  /// by default: a checkout inside another is normally work in its own right.
+  public var nestedRepositoriesSkipped: Set<String>? = nil
+  public func skipsNestedRepositories(_ cloneID: String) -> Bool { nestedRepositoriesSkipped?.contains(cloneID) == true }
+  /// Paths in one environment beneath which discovery reports nothing.
+  public func containerPaths(in environment: UUID) -> [String] {
+    let prefix = environment.uuidString + ":"
+    return (nestedRepositoriesSkipped ?? []).filter { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }.sorted()
+  }
   public static let defaultWatchActiveDays: Double = 30
   public static let defaultWatchSkipNames = [
     "node_modules", ".venv", "venv", "env", "site-packages", "vendor", "target", "build", "dist",

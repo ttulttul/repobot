@@ -14,7 +14,7 @@ struct RepositoryMapView: View {
           .frame(minWidth: 260, idealWidth: 300, maxWidth: 380)
         Group {
           if let group = model.selectedGroup {
-            RepositoryMapGroupView(state: state, group: group).id(group.id)
+            RepositoryMapGroupView(state: state, model: model, group: group).id(group.id)
           } else {
             ContentUnavailableView {
               Label("No Matching Repositories", systemImage: "folder")
@@ -68,6 +68,9 @@ private struct RepositoryMapSidebar: View {
         }
         Toggle("Shared across machines", isOn: $model.sharedOnly)
           .toggleStyle(.checkbox).font(.callout)
+        Toggle("Repositories with nested children only", isOn: $model.nestedOnly)
+          .toggleStyle(.checkbox).font(.callout)
+          .help("Find repositories that contain other repositories, such as an atlas of copies, to stop exploring inside them.")
       }.padding(14)
       Divider()
       List(selection: $model.selectedGroupID) {
@@ -144,6 +147,7 @@ private struct RepositoryMapProgressView: View {
 
 private struct RepositoryMapGroupView: View {
   let state: AppState
+  let model: RepositoryMapModel
   let group: RepositoryMapGroup
   var body: some View {
     ScrollView {
@@ -182,7 +186,7 @@ private struct RepositoryMapGroupView: View {
             Text("Expand to compare").font(.caption).foregroundStyle(.secondary)
           }
           ForEach(group.rows) { row in
-            RepositoryMapCopyView(state: state, row: row)
+            RepositoryMapCopyView(state: state, model: model, row: row)
           }
         }
         Text("Ages use each machine’s clock at its last check. Newest file is the latest file modification, including ignored files, excluding Git and macOS filesystem metadata. Checkouts and generated files can make it recent. Push status uses the last fetched upstream.")
@@ -206,6 +210,7 @@ private struct RepositoryMapMetric: View {
 
 private struct RepositoryMapCopyView: View {
   let state: AppState
+  let model: RepositoryMapModel
   let row: RepositoryMapRow
   @State private var expanded = false
 
@@ -233,6 +238,12 @@ private struct RepositoryMapCopyView: View {
         }
         RepositoryAgeView(age: row.age, lastCommitDate: repo.headSHA.isEmpty ? nil : repo.lastCommitDate, detailed: true)
         RepositoryMapCheckedTime(row: row).font(.caption2).foregroundStyle(.secondary)
+        if nested > 0 || skipsNested {
+          Toggle("Don’t explore repositories inside this one", isOn: Binding(
+            get: { state.configuration.skipsNestedRepositories(row.id) },
+            set: { state.setSkipsNestedRepositories($0, for: row.clone) }))
+            .toggleStyle(.checkbox).font(.callout)
+        }
         Button("Details…") { state.showDetail(row.clone) }
           .accessibilityLabel("Details for " + (repo.path as NSString).lastPathComponent + " on " + content.environmentName)
       }
@@ -252,6 +263,12 @@ private struct RepositoryMapCopyView: View {
         } else {
           Text(copySummary).font(.callout).foregroundStyle(.secondary)
         }
+        if nested > 0 || skipsNested {
+          Label(skipsNested && nested == 0 ? "Nested repositories are not explored"
+                : "\(nested) nested \(nested == 1 ? "repository" : "repositories") monitored separately"
+                  + (skipsNested ? " · being removed" : ""), systemImage: "square.stack.3d.down.right")
+            .font(.caption).foregroundStyle(skipsNested ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
+        }
         RepositoryMapCopyAge(row: row)
       }.padding(.vertical, 4)
     }
@@ -260,6 +277,8 @@ private struct RepositoryMapCopyView: View {
     .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
   }
 
+  private var nested: Int { model.nestedCounts[row.id] ?? 0 }
+  private var skipsNested: Bool { state.configuration.skipsNestedRepositories(row.id) }
   private var copySummary: String {
     let repo = row.content.repo
     if repo.conflicted > 0 { return "Unresolved conflicts" }

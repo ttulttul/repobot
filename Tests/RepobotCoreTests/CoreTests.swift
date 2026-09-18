@@ -430,6 +430,28 @@ struct CoreTests {
     #expect(world.environments.first?.mode.contains("FSEvents") == true)
     await monitor.stop()
   }
+  @Test func testContainerRepositoriesHideOnlyTheirOwnNestedRepositories() async throws {
+    let root = try temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let physical = LocalWatcher.physicalPath(root.path)
+    for path in ["atlas", "atlas/copies/one", "atlas/copies/two", "atlas-sibling", "work/outer", "work/outer/inner", "it's [odd]*", "it's [odd]*/nested"] {
+      try await repo(root.appendingPathComponent(path))
+    }
+    let everything = try await Probe.discover(roots: [root.path], using: LocalTransport())
+    #expect(everything.count == 8)
+    var configuration = Configuration()
+    let environment = UUID()
+    configuration.nestedRepositoriesSkipped = ["\(environment.uuidString):\(physical)/atlas", "\(environment.uuidString):\(physical)/it's [odd]*",
+                                               "\(UUID().uuidString):\(physical)/work/outer"]
+    let containers = configuration.containerPaths(in: environment)
+    #expect(containers == ["\(physical)/atlas", "\(physical)/it's [odd]*"])
+    let found = try await Probe.discover(roots: [root.path], containers: containers, using: LocalTransport())
+    // The containers remain; a sibling sharing the name prefix and other environments' settings are untouched.
+    #expect(found == ["atlas", "atlas-sibling", "it's [odd]*", "work/outer", "work/outer/inner"].map { physical + "/" + $0 })
+    // The host itself must do the pruning, so hundreds of copies cannot crowd out real work.
+    let raw = try await LocalTransport().run(script: Scripts.load("discover.sh"), arguments: [root.path] + containers, timeout: 60)
+    #expect(!raw.text.contains("copies/one") && !raw.text.contains("nested") && raw.text.contains("atlas-sibling"))
+  }
   @Test func testIdleRepositoriesAreHiddenUnlessTheyNeedAttention() throws {
     let now = Date(), day: TimeInterval = 86400
     func clone(commit: Double, file: Double? = nil, branch: Double? = nil, severity: Severity = .ok) -> Clone {

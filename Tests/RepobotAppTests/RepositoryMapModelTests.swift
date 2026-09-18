@@ -262,6 +262,34 @@ private final class MapChangeCounter: @unchecked Sendable {
     #expect(model.visitedRows - refreshed == 3)
   }
 
+  @Test func testNestedChildrenFilterFindsContainersAndKeepsSkippedOnes() {
+    var envs = inventory(), analyzer = IncrementalAnalyzer()
+    let config = Configuration(), model = RepositoryMapModel()
+    func add(_ path: String, to host: Int) {
+      var repo = RepoSnapshot(path: path)
+      repo.originURL = "https://example.test/nested\(path).git"; repo.branch = "main"; repo.headSHA = "tip"
+      envs[host].repos.append(repo)
+    }
+    // Host 0 holds an atlas with copies two levels down and a sibling sharing its name prefix.
+    for path in ["/repos/atlas", "/repos/atlas/copies/one", "/repos/atlas/copies/two", "/repos/atlas-sibling"] { add(path, to: 0) }
+    add("/repos/atlas/copies/one", to: 1)  // Same path on another machine has no parent there.
+    model.update(analyzer.analyze(envs, configuration: config))
+    let atlas = "\(envs[0].id.uuidString):/repos/atlas"
+    #expect(model.nestedCounts == [atlas: 2])
+    model.nestedOnly = true
+    #expect(model.visibleGroups.count == 1 && model.visibleGroups[0].rows.map(\.id) == [atlas])
+    // Once its children are excluded from discovery it must stay findable, to undo the setting.
+    envs[0].repos = SnapshotList(envs[0].repos.filter { !$0.path.hasPrefix("/repos/atlas/") })
+    model.nestedSkipped = [atlas]
+    model.update(analyzer.analyze(envs, configuration: config))
+    #expect(model.nestedCounts.isEmpty)
+    #expect(model.visibleGroups.count == 1 && model.visibleGroups[0].rows.map(\.id) == [atlas])
+    model.nestedSkipped = []
+    #expect(model.visibleGroups.isEmpty)
+    model.nestedOnly = false
+    #expect(model.visibleGroups.count > 80)
+  }
+
   @Test func testHistoryExpiryStructuralChangesAndNewAnalyzerReconcile() {
     var envs = inventory(), analyzer = IncrementalAnalyzer()
     let model = RepositoryMapModel(), config = Configuration()

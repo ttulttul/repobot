@@ -28,15 +28,20 @@ public enum Probe {
     }
     return c
   }
-  public static func discover(roots: [String], using transport: any Transport) async throws
-    -> [String]
-  {
+  /// `containers` are repositories that hold copies of other repositories (an atlas, a
+  /// mirror farm): nothing beneath them is reported. The containers themselves still are.
+  public static func discover(
+    roots: [String], containers: [String] = [], using transport: any Transport
+  ) async throws -> [String] {
     var paths = Set<String>()
+    let containers = containers.sorted()
     for root in roots {
       let result = try await transport.run(
-        script: Scripts.load("discover.sh"), arguments: [root], timeout: 60)
+        script: Scripts.load("discover.sh"), arguments: [root] + containers, timeout: 60)
       guard result.status == 0 else { throw RepobotError.message(result.errorText) }
-      paths.formUnion(tokens(result.stdout).prefix(500))
+      paths.formUnion(tokens(result.stdout).filter { path in
+        !containers.contains { path.hasPrefix($0 + "/") }
+      }.prefix(500))
     }
     return paths.sorted()
   }

@@ -133,6 +133,7 @@ import UserNotifications
     do {
       try persistence.save(next, to: "config.json")
       configuration = next
+      repositoryMapModel?.nestedSkipped = next.nestedRepositoriesSkipped ?? []
       needsSetup = next.environments.allSatisfy { $0.roots.isEmpty }
       error = nil
       apply()
@@ -241,6 +242,13 @@ import UserNotifications
   func resumeWarnings(_ clone: Clone) {
     changeConfiguration { $0.ignored.remove(clone.id); $0.snoozed[clone.id] = nil }
   }
+  func setSkipsNestedRepositories(_ skip: Bool, for clone: Clone) {
+    changeConfiguration {
+      var skipped = $0.nestedRepositoriesSkipped ?? []
+      if skip { skipped.insert(clone.id) } else { skipped.remove(clone.id) }
+      $0.nestedRepositoriesSkipped = skipped.isEmpty ? nil : skipped
+    }
+  }
   func ignore(_ clone: Clone) {
     changeConfiguration { $0.ignored.insert(clone.id) }
   }
@@ -312,6 +320,7 @@ import UserNotifications
       return
     }
     let model = RepositoryMapModel()
+    model.nestedSkipped = configuration.nestedRepositoriesSkipped ?? []
     model.update(world)
     repositoryMapModel = model
     show(key, title: "Repository Map", width: 980, height: 720) {
