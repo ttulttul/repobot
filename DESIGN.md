@@ -281,6 +281,12 @@ Details for the event tiers:
   chosen coding agent interactively in Terminal (in the repository, or with SSH details for a
   remote) with that evidence. The agent may only propose `.gitignore` edits and must show the diff
   before writing. A changed `.gitignore` emits `RESET`, so coverage is recomputed at once.
+- **Hiding idle repositories.** `hideIdleRepositories` (default on) leaves repositories out of the
+  menu when no branch has a commit and no working file is newer than `watchActiveDays`, judged
+  on the repository's own machine clock. Anything at attention or problem severity is always
+  shown, the Repository Map lists everything, and each environment's submenu says how many are
+  hidden. The watcher's own idle test (Git metadata mtimes) is deliberately independent: it must
+  work without the app's probe data and wakes on Git events.
 - **Watcher cost.** Linux only: FSEvents watches whole hierarchies with no per-directory cost, so
   Macs (local or remote) are not measured. Each watcher announces its process group (`GROUP`).
   While the Environments settings page is visible — and only then — the app samples that group

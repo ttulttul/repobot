@@ -228,6 +228,10 @@ private struct SettingsDetailView: View {
       Divider()
       number("Idle after", value: Binding(get: { draft.effectiveWatchActiveDays }, set: { draft.watchActiveDays = $0 }),
              unit: "days without Git activity (0 watches every repository)")
+      Toggle("Hide idle repositories from the menu", isOn: Binding(
+        get: { draft.effectiveHideIdleRepositories }, set: { draft.hideIdleRepositories = $0 }))
+      Text("Idle repositories that need attention are always shown, and the Repository Map lists everything.")
+        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       Text("On Linux, every watched folder uses one of a limited number of filesystem watches. Idle repositories are still watched for commits, checkouts and fetches, and safety sweeps catch other edits.")
         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       VStack(alignment: .leading, spacing: 6) {
@@ -363,6 +367,7 @@ private struct SettingsDetailView: View {
       next.upstreamCheck = validated.upstreamCheck
       next.batteryAware = validated.batteryAware
       next.watchActiveDays = validated.watchActiveDays
+      next.hideIdleRepositories = validated.hideIdleRepositories
       let names = Configuration.normalizedSkipNames(skipNames)
       next.watchSkipNames = names == Configuration.defaultWatchSkipNames ? nil : names
     case .notifications:

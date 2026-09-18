@@ -430,6 +430,31 @@ struct CoreTests {
     #expect(world.environments.first?.mode.contains("FSEvents") == true)
     await monitor.stop()
   }
+  @Test func testIdleRepositoriesAreHiddenUnlessTheyNeedAttention() throws {
+    let now = Date(), day: TimeInterval = 86400
+    func clone(commit: Double, file: Double? = nil, branch: Double? = nil, severity: Severity = .ok) -> Clone {
+      var repo = RepoSnapshot(path: "/repo")
+      repo.lastCommitDate = now.addingTimeInterval(-commit * day); repo.probedAt = now
+      repo.age = RepositoryAge(measuredAt: now, newestFileDate: file.map { now.addingTimeInterval(-$0 * day) })
+      if let branch { repo.branchCommitDates["feature"] = now.addingTimeInterval(-branch * day) }
+      return Clone(environmentID: UUID(), repo: repo, status: RepoStatus(identity: "r", severity: severity, findings: [], peers: []))
+    }
+    var configuration = Configuration()
+    #expect(configuration.hidesFromMenu(clone(commit: 40)))
+    #expect(!configuration.hidesFromMenu(clone(commit: 10)))
+    #expect(!configuration.hidesFromMenu(clone(commit: 40, file: 2)))       // edited recently
+    #expect(!configuration.hidesFromMenu(clone(commit: 40, branch: 3)))     // another branch is active
+    #expect(!configuration.hidesFromMenu(clone(commit: 400, severity: .attention)))
+    #expect(configuration.hidesFromMenu(clone(commit: 400, severity: .info)))
+    #expect(!configuration.hidesFromMenu(Clone(environmentID: UUID(), repo: RepoSnapshot(path: "/unprobed"),
+      status: RepoStatus(identity: "u", severity: .ok, findings: [], peers: []))))
+    configuration.watchActiveDays = 7
+    #expect(configuration.hidesFromMenu(clone(commit: 10)))
+    configuration.watchActiveDays = 0
+    #expect(!configuration.hidesFromMenu(clone(commit: 400)))
+    configuration.watchActiveDays = 30; configuration.hideIdleRepositories = false
+    #expect(!configuration.hidesFromMenu(clone(commit: 400)) && configuration.isIdle(clone(commit: 400).repo))
+  }
   @Test func testUpstreamBatchesRunConcurrently() async throws {
     #expect(Probe.upstreamConcurrency(cpus: 12, remote: false) == 8)
     #expect(Probe.upstreamConcurrency(cpus: 4, remote: false) == 4)

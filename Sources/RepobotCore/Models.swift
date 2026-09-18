@@ -252,6 +252,7 @@ public struct Configuration: Codable, Sendable, Equatable {
   // Optional so configurations saved before these existed still load.
   public var watchActiveDays: Double? = nil
   public var watchSkipNames: [String]? = nil
+  public var hideIdleRepositories: Bool? = nil
   public static let defaultWatchActiveDays: Double = 30
   public static let defaultWatchSkipNames = [
     "node_modules", ".venv", "venv", "env", "site-packages", "vendor", "target", "build", "dist",
@@ -261,6 +262,20 @@ public struct Configuration: Codable, Sendable, Equatable {
   public var effectiveWatchActiveDays: Double { max(0, watchActiveDays ?? Self.defaultWatchActiveDays) }
   /// Untracked directories with these names are never watched.
   public var effectiveWatchSkipNames: [String] { watchSkipNames ?? Self.defaultWatchSkipNames }
+  /// Idle repositories are left out of the menu unless they need attention. On by default.
+  public var effectiveHideIdleRepositories: Bool { hideIdleRepositories ?? true }
+  /// Idle: no commit on any branch and no working file newer than the idle period, measured on
+  /// the repository's own machine clock. Unknown ages never count as idle.
+  public func isIdle(_ repo: RepoSnapshot) -> Bool {
+    let days = effectiveWatchActiveDays
+    guard days > 0, repo.error == nil, repo.lastCommitDate.timeIntervalSince1970 > 0 else { return false }
+    let latest = ([repo.lastCommitDate, repo.age?.newestFileDate].compactMap { $0 } + repo.branchCommitDates.values).max()!
+    return (repo.age?.measuredAt ?? repo.probedAt).timeIntervalSince(latest) > days * 86400
+  }
+  /// Anything that needs attention stays visible however old it is.
+  public func hidesFromMenu(_ clone: Clone) -> Bool {
+    effectiveHideIdleRepositories && clone.status.severity < .attention && isIdle(clone.repo)
+  }
   public static func normalizedSkipNames(_ text: String) -> [String] {
     var seen = Set<String>()
     return text.split(whereSeparator: { $0.isNewline || $0 == "," })

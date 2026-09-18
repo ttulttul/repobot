@@ -111,7 +111,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
     if state.attentionCount > 0 { menu.addItem(.separator()) }
     for environment in state.world.environments {
-      let clones = state.world.clones.filter { $0.environmentID == environment.id }
+      let everyClone = state.world.clones.filter { $0.environmentID == environment.id }
+      let clones = everyClone.filter { !state.configuration.hidesFromMenu($0) }
       let severity = clones.map(\.status.severity).max() ?? .ok
       let item = NSMenuItem(
         title:
@@ -150,7 +151,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
       for clone in clones.sorted(by: repoSort) where !included.contains(clone.id) {
         submenu.addItem(repoItem(clone))
       }
-      if clones.isEmpty { header("No repositories found in configured roots", to: submenu) }
+      if everyClone.isEmpty { header("No repositories found in configured roots", to: submenu) }
+      let hidden = everyClone.count - clones.count
+      if hidden > 0 {
+        submenu.addItem(.separator())
+        let days = Int(state.configuration.effectiveWatchActiveDays)
+        submenu.addItem(MenuAction("\(hidden) idle for \(days)+ days hidden — Show in Repository Map…") { [state] in
+          state.showRepositoryMap()
+        })
+      }
       submenu.addItem(.separator())
       submenu.addItem(
         MenuAction("Rescan for Repositories", enabled: !state.checking) { [state] in state.check(environment.id, rescan: true)
