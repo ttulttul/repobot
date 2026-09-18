@@ -430,6 +430,29 @@ struct CoreTests {
     #expect(world.environments.first?.mode.contains("FSEvents") == true)
     await monitor.stop()
   }
+  @Test func testWatcherCostFormattingAndParsing() throws {
+    #expect(WatcherCost.count(842) == "842")
+    #expect(WatcherCost.count(1_400) == "1.4K")
+    #expect(WatcherCost.count(14_000) == "14K")
+    #expect(WatcherCost.count(524_288) == "524K")
+    #expect(WatcherCost.count(999_999) == "1M")
+    #expect(WatcherCost.count(1_048_576) == "1M")
+    #expect(WatcherCost.memory(64 * 1024 * 1024) == "64MB")
+    #expect(WatcherCost.memory(1_288_490_189) == "1.2GB")
+    #expect(WatcherCost.memory(300_000) == "293KB")
+    let first = try #require(WatcherCostSampler.parse(
+      "processes=1\nticks=100\nhz=100\nrss=67108864\nuptime=50.00\nkind=inotify\nhandles=14000\nlimit=524288\n", previous: nil))
+    #expect(first.0.cpuText == "—" && first.0.memoryText == "64MB")
+    #expect(first.0.handlesText == "14K of 524K inotify watches")
+    let second = try #require(WatcherCostSampler.parse(
+      "processes=1\nticks=106\nhz=100\nrss=67108864\nuptime=52.00\nkind=inotify\nhandles=14000\nlimit=524288\n", previous: first.1))
+    #expect(second.0.cpuText == "3%")
+    let mac = try #require(WatcherCostSampler.parse("processes=2\ncpu=0.2\nrss=1048576\nkind=files\nhandles=21\nlimit=256\n", previous: nil))
+    #expect(mac.0.cpuText == "<1%" && mac.0.handlesText == "21 of 256 open files")
+    #expect(WatcherCostSampler.parse("processes=0\nkind=inotify\n", previous: nil) == nil)
+    let local = WatcherCostSampler.local(previous: nil).0
+    #expect(local.inProcess && (local.handles ?? 0) > 0 && (local.memoryBytes ?? 0) > 0)
+  }
   @Test func testPythonMacWatcherOverStdin() async throws {
     let root = try temporary()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -523,6 +546,11 @@ struct CoreTests {
       try await Task.sleep(for: .milliseconds(100))
     }
     #expect(await events.ready)
+    let group = try #require(await events.group)
+    let (cost, reading) = try #require(try await WatcherCostSampler.remote(group: group, transport: transport, previous: nil))
+    #expect(cost.handleKind == .inotify && cost.processes == 1)
+    #expect((cost.handles ?? 0) > 0 && (cost.handleLimit ?? 0) > (cost.handles ?? 0))
+    #expect((cost.memoryBytes ?? 0) > 1_000_000 && cost.cpuPercent == nil && reading != nil)
     let edit = try await transport.run(
       script: "printf 'changed\\n' > /repos/demo/tracked", arguments: [], timeout: 10)
     #expect(edit.status == 0)
@@ -608,8 +636,10 @@ private func expectThrows<T>(
 private actor EventRecorder {
   var ready = false
   var changed = false
+  var group: Int32?
   func add(_ event: WatchEvent) {
     switch event {
+    case .group(let value): group = value
     case .ready: ready = true
     case .changed, .changedPaths: changed = true
     default: break

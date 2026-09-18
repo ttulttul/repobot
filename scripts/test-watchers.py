@@ -53,7 +53,8 @@ class RemoteWatcherTests(unittest.TestCase):
                 process = subprocess.Popen([sys.executable, '-', repo, '--', repo], stdin=script,
                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             try:
-                self.assertEqual(process.stdout.read(6), b'READY\0')
+                group = b'GROUP\0' + str(os.getpgrp()).encode() + b'\0'
+                self.assertEqual(process.stdout.read(len(group) + 6), group + b'READY\0')
                 process.stdout.close()
                 self.assertEqual(process.wait(timeout=5), 0)
             finally:

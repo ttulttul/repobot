@@ -8,6 +8,8 @@ public enum WatchEvent: Sendable {
   case changedPaths([String])
   case rescan, reset
   case limited(String)
+  /// Process group of a remote watcher, for sampling its resource cost.
+  case group(Int32)
   case ended, failed(String)
 }
 public final class LocalWatcher: @unchecked Sendable {
@@ -144,7 +146,9 @@ public final class RemoteWatcher: @unchecked Sendable {
         (trap '' PIPE; while sleep 30; do printf 'PING\\000' 2>/dev/null || kill 0; done) &
         ping=$!
         trap 'kill "$ping" 2>/dev/null' EXIT HUP INT TERM
-        printf 'READY\\000'
+        group=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+        case "$group" in ''|*[!0-9]*) group=$$;; esac
+        printf 'GROUP\\000%s\\000READY\\000' "$group"
         \(command) | while IFS= read -r line; do printf 'RESCAN\\000'; done
         """
     }
@@ -193,7 +197,11 @@ private final class WatchParser: @unchecked Sendable {
       let value = String(decoding: buffer[..<end], as: UTF8.self)
       buffer.removeSubrange(...end)
       if let key = pending {
-        handler(key == "CHANGED" ? .changed(value) : .limited(value))
+        switch key {
+        case "CHANGED": handler(.changed(value))
+        case "GROUP": if let group = Int32(value), group > 1 { handler(.group(group)) }
+        default: handler(.limited(value))
+        }
         pending = nil
       } else {
         switch value {
@@ -201,7 +209,7 @@ private final class WatchParser: @unchecked Sendable {
         case "PING": handler(.ping)
         case "RESCAN": handler(.rescan)
         case "RESET": handler(.reset)
-        case "CHANGED", "LIMIT": pending = value
+        case "CHANGED", "LIMIT", "GROUP": pending = value
         default: break
         }
       }

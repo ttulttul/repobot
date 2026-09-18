@@ -294,6 +294,7 @@ def macos():
 if __name__ == '__main__':
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=hangup_guard, daemon=True).start()
+    emit('GROUP', str(os.getpgrp()))  # Lets the client sample this watcher's resource cost.
     if sys.platform == 'linux':
         linux()
     elif sys.platform == 'darwin':

@@ -26,7 +26,7 @@ resource_directory="$bin/Repobot_RepobotCore.bundle/Resources"
 if [[ ! -f "$resource_directory/probe.sh" ]]; then
   resource_directory="$bin/Repobot_RepobotCore.bundle/Contents/Resources/Resources"
 fi
-for resource in probe.sh upstream.sh discover.sh capabilities.sh watcher.py; do
+for resource in probe.sh upstream.sh discover.sh capabilities.sh watcher.py cost.sh; do
   cp "$resource_directory/$resource" "$app/Contents/Resources/RepobotCore/$resource"
 done
 codesign --force --deep --sign "${SIGN_IDENTITY:--}" --options runtime --entitlements Repobot.entitlements "$app"

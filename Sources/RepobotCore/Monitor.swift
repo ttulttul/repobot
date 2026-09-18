@@ -29,6 +29,7 @@ public actor EnvironmentMonitor {
   private var sweepRetryAt = Date.distantPast
   private var capabilities: Capabilities?
   private var watcherGeneration = UUID()
+  private var watcherGroup: Int32?, watcherCPU: WatcherCPUReading?
   private var watcherCoverage: WatcherCoverage?
   private var resetWatcherCoverage = false
   private(set) var watcherStarts = 0
@@ -387,6 +388,7 @@ public actor EnvironmentMonitor {
       }
       await store.merge(snapshot, changedPaths: [])
     case .ping: lastHeartbeat = Date()
+    case .group(let group): watcherGroup = group
     case .ended: await watcherFailed("Remote watcher ended unexpectedly")
     case .failed(let message): await watcherFailed(message)
     case .limited(let message):
@@ -433,8 +435,25 @@ public actor EnvironmentMonitor {
       } catch {}
     }
   }
+  /// Sampled on demand while the environment settings are visible; nil without a watcher.
+  public func watcherCost() async -> WatcherCost? {
+    if localWatcher != nil {
+      let (cost, reading) = WatcherCostSampler.local(previous: watcherCPU)
+      watcherCPU = reading
+      return cost
+    }
+    guard remoteWatcher != nil, let group = watcherGroup else { return nil }
+    let generation = watcherGeneration
+    guard let (cost, reading) = try? await WatcherCostSampler.remote(
+      group: group, transport: transport, previous: watcherCPU), generation == watcherGeneration
+    else { return nil }
+    watcherCPU = reading
+    return cost
+  }
   private func stopWatchers() {
     watcherGeneration = UUID()
+    watcherGroup = nil
+    watcherCPU = nil
     watcherCoverage = nil
     localWatcher?.stop()
     localWatcher = nil

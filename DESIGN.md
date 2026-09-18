@@ -268,6 +268,12 @@ Details for the event tiers:
   noticing (sleep, network change) is covered by replacement: each watcher holds a Linux abstract
   socket named after the client (this Mac + binary + environment); a new watcher from the same
   client asks the old one to exit. Nothing is written on the remote.
+- **Watcher cost.** Each watcher announces its process group (`GROUP`). While the Environments
+  settings page is visible — and only then — the app samples that group every 2 s over the
+  multiplexed connection (`cost.sh`, stdin-only like every other script) and shows CPU ("3%"), RAM
+  ("64MB") and the watch mechanism's handles against its limit ("14K of 524K inotify watches" on
+  Linux; open files against the descriptor limit on macOS). The local FSEvents watcher runs
+  in-process, so its figures are Repobot's own.
 - **Safety sweep.** Even in event mode a full probe runs every 5 min (configurable) to catch anything
   the watcher missed and to run the upstream check.
 - **Debounce.** Events are coalesced per repo for 2 s (an editor save or `git commit` produces dozens

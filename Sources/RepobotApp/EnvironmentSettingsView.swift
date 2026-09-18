@@ -92,6 +92,7 @@ struct EnvironmentSettingsView: View {
           Button(snapshot?.reconnecting == true ? "Watcher issue…" : "Details…") { diagnostics = snapshot }
             .disabled(snapshot == nil)
         }
+        PreferenceRow(title: "Watcher cost") { WatcherCostView(state: state, environment: env.id) }
         PreferenceRow(title: "Repositories") { Text("\(snapshot?.repos.count ?? 0) in \(env.roots.count) root folders") }
         PreferenceRow(title: "Last check") {
           Text(snapshot?.checkedAt?.formatted(.relative(presentation: .named)) ?? "Not checked yet").foregroundStyle(.secondary)
@@ -117,6 +118,43 @@ struct EnvironmentSettingsView: View {
     if panel.runModal() == .OK {
       var draft = environment; draft.roots = panel.urls.map(\.path)
       state.update(draft)
+    }
+  }
+}
+
+/// Live while visible only: sampling a remote watcher runs a command on that machine.
+private struct WatcherCostView: View {
+  let state: AppState
+  let environment: UUID
+  @State private var cost: WatcherCost?
+  @State private var sampled = false
+  var body: some View {
+    VStack(alignment: .leading, spacing: 5) {
+      if let cost {
+        HStack(spacing: 14) {
+          Label(cost.cpuText + " CPU", systemImage: "cpu")
+          Label(cost.memoryText + " RAM", systemImage: "memorychip")
+        }
+        Text(cost.handlesText)
+        if let fraction = cost.handleFraction {
+          ProgressView(value: fraction).tint(fraction > 0.8 ? .orange : .accentColor).frame(maxWidth: 220)
+            .accessibilityLabel("Share of the limit in use")
+        }
+        Text(cost.inProcess ? "Measured for Repobot itself; the local watcher runs inside the app."
+          : cost.processes == 1 ? "One watcher process on this machine." : "\(cost.processes) watcher processes on this machine.")
+          .font(.caption).foregroundStyle(.secondary)
+      } else {
+        Text(sampled ? "No watcher process is running" : "Measuring…").foregroundStyle(.secondary)
+      }
+    }
+    .monospacedDigit()
+    .task(id: environment) {
+      cost = nil; sampled = false
+      while !Task.isCancelled {
+        cost = await state.monitors[environment]?.watcherCost()
+        sampled = true
+        try? await Task.sleep(for: .seconds(2))
+      }
     }
   }
 }
