@@ -430,6 +430,42 @@ struct CoreTests {
     #expect(world.environments.first?.mode.contains("FSEvents") == true)
     await monitor.stop()
   }
+  @Test func testWatchEconomySettingsAndGitignoreFixPrompt() throws {
+    // Configurations saved before these settings existed must still load.
+    var legacy = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(Configuration())) as? [String: Any])
+    legacy.removeValue(forKey: "watchActiveDays"); legacy.removeValue(forKey: "watchSkipNames")
+    var configuration = try JSONDecoder().decode(Configuration.self, from: JSONSerialization.data(withJSONObject: legacy))
+    #expect(configuration.effectiveWatchActiveDays == 30)
+    #expect(configuration.effectiveWatchSkipNames.contains("__pycache__") && configuration.effectiveWatchSkipNames.contains(".gradle"))
+    configuration.watchActiveDays = 0
+    #expect(configuration.effectiveWatchActiveDays == 0)
+    #expect(Configuration.normalizedSkipNames(" venv \n\nvenv, a/b\n..\n.cache") == ["venv", ".cache"])
+    let usage = try JSONDecoder().decode(WatchUsage.self, from: Data(#"""
+      {"total":9300,"limit":524288,"dormant":120,"repos":[
+        {"path":"/home/k/git/mc-policy-v2","watches":2000,"wanted":7230,"untracked":[{"path":".gradle-docker","directories":4646}]},
+        {"path":"/home/k/git/n8n","watches":2000,"wanted":2891,"untracked":[]},
+        {"path":"/home/k/git/small","watches":40,"wanted":40,"untracked":[{"path":"tmp","directories":30}]}]}
+      """#.utf8))
+    #expect(usage.fixable.map(\.path) == ["/home/k/git/mc-policy-v2"])
+    var remote = Environment(name: "devbox", kind: .ssh); remote.host = "devbox"; remote.user = "ken"; remote.port = 2222
+    let prompt = WatchHygiene.prompt(environment: remote, repository: usage.repos[0], configuration: configuration)
+    #expect(prompt.contains("- .gradle-docker/ — 4646 directories"))
+    #expect(prompt.contains("'-p' '2222' '--' 'ken@devbox'") && prompt.contains("/home/k/git/mc-policy-v2"))
+    #expect(prompt.contains("wait for my approval"))
+    let local = WatchHygiene.prompt(environment: .local, repository: usage.repos[0], configuration: configuration)
+    #expect(local.contains("current directory") && !local.contains("ssh"))
+  }
+  @Test func testGitignoreFixScriptStartsAgentInRepositoryWithPrompt() async throws {
+    let root = try temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    var profile = AgentProfile(name: "Echo", harness: .claude); profile.executable = "/bin/echo"
+    let repository = WatchUsage.Repository(path: root.path, watches: 500, wanted: 500,
+      untracked: [WatchUsage.Tree(path: "job'lib", directories: 480)])
+    let script = try WatchHygiene.script(profile: profile, environment: .local, repository: repository,
+      configuration: Configuration(), directory: root.appendingPathComponent("fix"))
+    let result = try await ProcessRunner.run("/bin/sh", [script.path], timeout: 10)
+    #expect(result.status == 0 && result.text.contains("- job'lib/ — 480 directories"))
+  }
   @Test func testWatcherCostFormattingAndParsing() throws {
     #expect(WatcherCost.count(842) == "842")
     #expect(WatcherCost.count(1_400) == "1.4K")
@@ -547,6 +583,9 @@ struct CoreTests {
     }
     #expect(await events.ready)
     let group = try #require(await events.group)
+    for _ in 0..<50 where await events.usage == nil { try await Task.sleep(for: .milliseconds(100)) }
+    let usage = try #require(await events.usage)
+    #expect(usage.total > 0 && usage.limit > usage.total && usage.repos.first?.path == paths[0])
     let (cost, reading) = try #require(try await WatcherCostSampler.remote(group: group, transport: transport, previous: nil))
     #expect(cost.handleKind == .inotify && cost.processes == 1)
     #expect((cost.handles ?? 0) > 0 && (cost.handleLimit ?? 0) > (cost.handles ?? 0))
@@ -637,9 +676,11 @@ private actor EventRecorder {
   var ready = false
   var changed = false
   var group: Int32?
+  var usage: WatchUsage?
   func add(_ event: WatchEvent) {
     switch event {
     case .group(let value): group = value
+    case .usage(let value): usage = value
     case .ready: ready = true
     case .changed, .changedPaths: changed = true
     default: break

@@ -349,6 +349,7 @@ public actor EnvironmentMonitor {
     } else if Date() < retryAt { return }
     resetWatcherCoverage = false
     snapshot.watcherCoverageWarning = nil
+    snapshot.watchUsage = nil
     do {
       watcherGeneration = UUID()
       let generation = watcherGeneration
@@ -364,7 +365,9 @@ public actor EnvironmentMonitor {
         remoteWatcher = try RemoteWatcher(
           transport: transport, roots: environment.roots, repos: snapshot.repos.map(\.path),
           capabilities: capabilities, gitDirectories: coverage.gitDirectories,
-          clientID: RemoteWatcher.clientID(environment: environment.id), handler: handler)
+          clientID: RemoteWatcher.clientID(environment: environment.id),
+          skipNames: configuration.effectiveWatchSkipNames,
+          activeDays: configuration.effectiveWatchActiveDays, handler: handler)
         snapshot.mode =
           "Events — \(capabilities.python ? (capabilities.os == "Linux" ? "inotify via python3" : "FSEvents via python3") : capabilities.inotifywait ? "inotifywait" : "fswatch")"
         lastHeartbeat = Date()
@@ -389,6 +392,9 @@ public actor EnvironmentMonitor {
       await store.merge(snapshot, changedPaths: [])
     case .ping: lastHeartbeat = Date()
     case .group(let group): watcherGroup = group
+    case .usage(let usage):
+      snapshot.watchUsage = usage
+      await store.merge(snapshot, changedPaths: [])
     case .ended: await watcherFailed("Remote watcher ended unexpectedly")
     case .failed(let message): await watcherFailed(message)
     case .limited(let message):

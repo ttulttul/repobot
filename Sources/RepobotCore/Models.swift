@@ -149,6 +149,7 @@ public struct EnvironmentSnapshot: Identifiable, Codable, Sendable {
   public var checkProgress: String? = nil
   public var watcherFailure: WatcherFailure? = nil
   public var watcherCoverageWarning: String? = nil
+  public var watchUsage: WatchUsage? = nil
   public var lastCheckReason: String? = nil
   public var lastCheckStartedAt: Date? = nil
   public var lastCheckFinishedAt: Date? = nil
@@ -210,6 +211,28 @@ public struct WorldSnapshot: Codable, Sendable {
     }
   }
 }
+/// Reported by the Linux watcher: where its inotify watches went.
+public struct WatchUsage: Codable, Sendable, Equatable {
+  public struct Tree: Codable, Sendable, Equatable {
+    public var path: String, directories: Int
+  }
+  public struct Repository: Codable, Sendable, Equatable, Identifiable {
+    public var id: String { path }
+    public var path: String
+    public var watches: Int, wanted: Int
+    /// Topmost untracked, not ignored directories and the watches each accounts for.
+    public var untracked: [Tree]
+    public var untrackedWatches: Int { untracked.reduce(0) { $0 + $1.directories } }
+  }
+  public var total: Int, limit: Int
+  /// Repositories without recent Git activity: Git state is watched, the working tree is not.
+  public var dormant: Int
+  public var repos: [Repository]
+  /// Worth offering a .gitignore fix: many watches, mostly spent on untracked trees.
+  public var fixable: [Repository] {
+    repos.filter { $0.untrackedWatches >= 100 && $0.untrackedWatches * 2 >= $0.wanted }
+  }
+}
 public struct Configuration: Codable, Sendable, Equatable {
   public var version = 1
   public var environments: [Environment] = [.local]
@@ -224,6 +247,24 @@ public struct Configuration: Codable, Sendable, Equatable {
   public var debugLogging = false, batteryAware = false
   public var reportStaleBranches = false
   public var staleBranchDays: Double = 90
+  // Optional so configurations saved before these existed still load.
+  public var watchActiveDays: Double? = nil
+  public var watchSkipNames: [String]? = nil
+  public static let defaultWatchActiveDays: Double = 30
+  public static let defaultWatchSkipNames = [
+    "node_modules", ".venv", "venv", "env", "site-packages", "vendor", "target", "build", "dist",
+    ".gradle", "__pycache__", ".tox", ".mypy_cache", ".pytest_cache", ".next", ".cache",
+  ]
+  /// Repositories without Git activity for this many days get no working-tree watches. 0 watches all.
+  public var effectiveWatchActiveDays: Double { max(0, watchActiveDays ?? Self.defaultWatchActiveDays) }
+  /// Untracked directories with these names are never watched.
+  public var effectiveWatchSkipNames: [String] { watchSkipNames ?? Self.defaultWatchSkipNames }
+  public static func normalizedSkipNames(_ text: String) -> [String] {
+    var seen = Set<String>()
+    return text.split(whereSeparator: { $0.isNewline || $0 == "," })
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .filter { !$0.isEmpty && !$0.contains("/") && $0 != "." && $0 != ".." && seen.insert($0).inserted }
+  }
   public init() {}
   public mutating func validate() {
     pollInterval = max(10, pollInterval)

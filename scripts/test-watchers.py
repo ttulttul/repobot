@@ -38,12 +38,25 @@ class RemoteWatcherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repo = os.path.realpath(temporary)
             subprocess.run(['git', 'init', '-q', repo], check=True)
-            for directory in ('src/deep', 'untracked', 'models/cache', 'node_modules/package'):
+            for directory in ('src/deep', 'src/build', 'untracked/more', 'untracked/__pycache__', 'models/cache', 'node_modules/package'):
                 os.makedirs(os.path.join(repo, directory))
                 open(os.path.join(repo, directory, 'file'), 'w').close()
             with open(repo + '/.gitignore', 'w') as ignore: ignore.write('models/\n')
             subprocess.run(['git', '-C', repo, 'add', 'src'], check=True)
-            self.assertEqual(w.work_directories(repo), [repo] + [repo + '/' + d for d in ('src', 'untracked', 'src/deep')])
+            directories, trees = w.work_directories(repo)
+            # Skipped names apply below untracked directories only: tracked src/build is source.
+            self.assertEqual(directories, [repo] + [repo + '/' + d for d in ('src', 'untracked', 'src/build', 'src/deep', 'untracked/more')])
+            self.assertEqual(dict(trees), {'untracked': 2})
+    def test_dormant_repositories_are_identified_by_git_activity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            gitdir = os.path.realpath(temporary)
+            for name in ('index', 'HEAD'): open(os.path.join(gitdir, name), 'w').close()
+            self.assertFalse(w.dormant([gitdir], 30))
+            old = time.time() - 40 * 86400
+            for name in ('index', 'HEAD'): os.utime(os.path.join(gitdir, name), (old, old))
+            self.assertTrue(w.dormant([gitdir], 30))
+            self.assertFalse(w.dormant([gitdir], 60))
+            self.assertFalse(w.dormant([gitdir], 0))
     def test_watcher_exits_when_client_closes_stdout(self):
         # Orphans accumulated per reconnect: a quiet watcher never wrote, so never noticed.
         with tempfile.TemporaryDirectory() as temporary:

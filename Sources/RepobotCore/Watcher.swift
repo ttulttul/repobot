@@ -10,6 +10,7 @@ public enum WatchEvent: Sendable {
   case limited(String)
   /// Process group of a remote watcher, for sampling its resource cost.
   case group(Int32)
+  case usage(WatchUsage)
   case ended, failed(String)
 }
 public final class LocalWatcher: @unchecked Sendable {
@@ -110,6 +111,7 @@ public final class RemoteWatcher: @unchecked Sendable {
   public init(
     transport: any Transport, roots: [String], repos: [String], capabilities: Capabilities,
     gitDirectories: [String: [String]] = [:], clientID: String? = nil,
+    skipNames: [String] = Configuration.defaultWatchSkipNames, activeDays: Double = 0,
     handler: @escaping @Sendable (WatchEvent) -> Void
   ) throws {
     let script: String
@@ -123,13 +125,16 @@ public final class RemoteWatcher: @unchecked Sendable {
       let client = (clientID ?? "").filter { $0.isHexDigit }
       script = "import json, base64\nknown_git_directories = json.loads(base64.b64decode('" + inventory + "'))\n"
         + "client_id = '" + client + "'\n"
+        + "skip_names = json.loads(base64.b64decode('" + (try JSONEncoder().encode(skipNames).base64EncodedString()) + "'))\n"
+        + "active_days = " + String(max(0, activeDays.isFinite ? activeDays : 0)) + "\n"
         + (try Scripts.load("watcher.py"))
     } else {
       program = "sh"
       args = ["-s", "--"] + roots + repos + gitDirectories.values.flatMap { $0 }
       // Recursive tools spend one inotify watch per directory; keep them out of
       // dependency trees and Git object stores.
-      let skipped = "/(node_modules|\\.venv|vendor|target|build|dist|\\.git/(objects|logs|lfs|modules))(/|$)"
+      let names = skipNames.map { NSRegularExpression.escapedPattern(for: $0).replacingOccurrences(of: "'", with: ".") }
+      let skipped = "/(" + (names + ["\\.git/(objects|logs|lfs|modules)"]).joined(separator: "|") + ")(/|$)"
       let command =
         capabilities.inotifywait
         ? "inotifywait -q -m -r --exclude '\(skipped)' -e modify,attrib,move,create,delete -- \"$@\""
@@ -200,6 +205,7 @@ private final class WatchParser: @unchecked Sendable {
         switch key {
         case "CHANGED": handler(.changed(value))
         case "GROUP": if let group = Int32(value), group > 1 { handler(.group(group)) }
+        case "USAGE": if let usage = try? JSONDecoder().decode(WatchUsage.self, from: Data(value.utf8)) { handler(.usage(usage)) }
         default: handler(.limited(value))
         }
         pending = nil
@@ -209,7 +215,7 @@ private final class WatchParser: @unchecked Sendable {
         case "PING": handler(.ping)
         case "RESCAN": handler(.rescan)
         case "RESET": handler(.reset)
-        case "CHANGED", "LIMIT", "GROUP": pending = value
+        case "CHANGED", "LIMIT", "GROUP", "USAGE": pending = value
         default: break
         }
       }

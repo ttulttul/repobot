@@ -268,6 +268,19 @@ Details for the event tiers:
   noticing (sleep, network change) is covered by replacement: each watcher holds a Linux abstract
   socket named after the client (this Mac + binary + environment); a new watcher from the same
   client asks the old one to exit. Nothing is written on the remote.
+- **Watch economy.** Three further limits on the Linux watch count. (1) *Idle repositories*: no
+  commit, checkout, staging or reset (mtime of `index`, `HEAD`, `ORIG_HEAD`, `logs/HEAD`) within
+  `watchActiveDays` (default 30; 0 disables) means Git-state watches only; any Git-state event
+  wakes the repository and registers its working tree. (2) *Skipped names*: `watchSkipNames`
+  (node_modules, .venv, venv, env, site-packages, vendor, target, build, dist, .gradle, __pycache__,
+  .tox, .mypy_cache, .pytest_cache, .next, .cache; editable under General → Checks) are never
+  watched below untracked directories. Tracked directories are always watched, whatever their
+  name. (3) *.gitignore hygiene*: the watcher reports (`USAGE`) its ten heaviest repositories and
+  the topmost untracked directories responsible. Where those account for ≥100 watches and at least
+  half of a repository's total, Environments settings offers "Fix .gitignore…", which opens the
+  chosen coding agent interactively in Terminal (in the repository, or with SSH details for a
+  remote) with that evidence. The agent may only propose `.gitignore` edits and must show the diff
+  before writing. A changed `.gitignore` emits `RESET`, so coverage is recomputed at once.
 - **Watcher cost.** Each watcher announces its process group (`GROUP`). While the Environments
   settings page is visible — and only then — the app samples that group every 2 s over the
   multiplexed connection (`cost.sh`, stdin-only like every other script) and shows CPU ("3%"), RAM

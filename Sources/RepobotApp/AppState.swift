@@ -372,6 +372,17 @@ import UserNotifications
     }
     terminal(command)
   }
+  /// Opens the profile's interactive CLI in Terminal with the evidence; the user approves every edit there.
+  func fixGitignore(_ repository: WatchUsage.Repository, in environment: RepobotCore.Environment, using profile: AgentProfile) {
+    do {
+      let directory = Persistence.defaultDirectory.appendingPathComponent("watch-fixes")
+        .appendingPathComponent(UUID().uuidString)
+      let script = try WatchHygiene.script(
+        profile: profile, environment: environment, repository: repository,
+        configuration: configuration, directory: directory)
+      if terminal("/bin/sh " + shellQuote(script.path)) { error = nil }
+    } catch { self.error = error.localizedDescription }
+  }
   @discardableResult func terminal(_ command: String) -> Bool {
     let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(
       of: "\"", with: "\\\"")

@@ -93,6 +93,7 @@ struct EnvironmentSettingsView: View {
             .disabled(snapshot == nil)
         }
         PreferenceRow(title: "Watcher cost") { WatcherCostView(state: state, environment: env.id) }
+        if let usage = snapshot?.watchUsage { watchUsage(usage, in: env) }
         PreferenceRow(title: "Repositories") { Text("\(snapshot?.repos.count ?? 0) in \(env.roots.count) root folders") }
         PreferenceRow(title: "Last check") {
           Text(snapshot?.checkedAt?.formatted(.relative(presentation: .named)) ?? "Not checked yet").foregroundStyle(.secondary)
@@ -111,6 +112,38 @@ struct EnvironmentSettingsView: View {
       if let error = state.error { OperationErrorView(message: error) }
       Spacer(minLength: 0)
     }.padding(.horizontal, 24).padding(.bottom, 24) }
+  }
+  @ViewBuilder private func watchUsage(_ usage: WatchUsage, in env: RepobotCore.Environment) -> some View {
+    PreferenceRow(title: "Most watched") {
+      VStack(alignment: .leading, spacing: 8) {
+        ForEach(usage.repos.prefix(5)) { repository in
+          let fixable = usage.fixable.contains(repository)
+          HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+              Text((repository.path as NSString).lastPathComponent).lineLimit(1).help(repository.path)
+              Text(WatcherCost.count(repository.watches) + " watches"
+                + (repository.wanted > repository.watches ? " (capped; wants \(WatcherCost.count(repository.wanted)))" : "")
+                + (fixable ? " · " + repository.untracked.prefix(2).map { "\($0.path)/ \(WatcherCost.count($0.directories))" }.joined(separator: ", ") + " untracked" : ""))
+                .font(.caption).foregroundStyle(fixable ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary)).lineLimit(2)
+            }
+            Spacer(minLength: 0)
+            if fixable {
+              Menu("Fix .gitignore…") {
+                ForEach(state.agents.profiles) { profile in
+                  Button("Ask \(profile.name)") { state.fixGitignore(repository, in: env, using: profile) }
+                }
+                if state.agents.profiles.isEmpty { Button("Set Up a Coding Agent…") { state.showAgentSettings() } }
+              }.fixedSize()
+                .help("Opens a coding agent in Terminal to propose .gitignore entries for these untracked directories. Nothing is written without your approval.")
+            }
+          }
+        }
+        if usage.dormant > 0 {
+          Text("\(usage.dormant) idle \(usage.dormant == 1 ? "repository is" : "repositories are") watched for Git activity only.")
+            .font(.caption).foregroundStyle(.secondary)
+        }
+      }.monospacedDigit()
+    }
   }
   private func chooseRoot(for environment: RepobotCore.Environment) {
     let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false

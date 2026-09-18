@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Stdin-only Linux inotify / macOS FSEvents watcher. Python standard library only."""
-import ctypes, os, select, socket, struct, subprocess, sys, threading, time, errno, collections
+import ctypes, json, os, select, socket, struct, subprocess, sys, threading, time, errno, collections
 
-SKIP = {'.git', 'node_modules', '.venv', 'vendor', 'target', 'build', 'dist', 'Library', '.Trash'}
+# Directory names never worth a watch when untracked. The client may replace the list.
+SKIP = {'.git', 'Library', '.Trash'} | set(globals().get('skip_names') or (
+    'node_modules', '.venv', 'venv', 'env', 'site-packages', 'vendor', 'target', 'build', 'dist',
+    '.gradle', '__pycache__', '.tox', '.mypy_cache', '.pytest_cache', '.next', '.cache'))
 roots = sys.argv[1:sys.argv.index('--')] if '--' in sys.argv else []
 repos = sys.argv[sys.argv.index('--') + 1:] if '--' in sys.argv else sys.argv[1:]
 write_lock = threading.Lock()
@@ -79,19 +82,43 @@ def git(repo, *arguments):
     return subprocess.run(['git', '-C', repo] + list(arguments), capture_output=True,
                           env=dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
 def work_directories(repo):
-    """Directories holding tracked or untracked-but-not-ignored files, shallowest first.
-    Ignored dependency and model trees would otherwise consume nearly every watch."""
-    p = git(repo, 'ls-files', '-z', '--cached', '--others', '--exclude-standard')
-    found = {''}
+    """Directories holding tracked or untracked-but-not-ignored files, shallowest first,
+    and how many each topmost untracked directory contributes. Ignored dependency and
+    model trees would otherwise consume nearly every watch. Skipped names apply only
+    below untracked directories: a tracked build/ is source."""
+    p = git(repo, 'ls-files', '-z', '-t', '--cached', '--others', '--exclude-standard')
+    tracked, untracked = {''}, set()
     if p.returncode == 0:
-        for name in p.stdout.split(b'\0'):
-            directory = os.path.dirname(os.fsdecode(name))
+        for entry in p.stdout.split(b'\0'):
+            directory = os.path.dirname(os.fsdecode(entry[2:]))
+            found = untracked if entry[:1] == b'?' else tracked
             while directory and directory not in found:
                 found.add(directory)
                 directory = os.path.dirname(directory)
-    ordered = sorted(found, key=lambda d: (d.count(os.sep) if d else -1, d))
-    return [os.path.join(repo, d) if d else repo for d in ordered
-            if not any(part in SKIP for part in d.split(os.sep))]
+    untracked -= tracked
+    kept, trees = set(tracked), collections.Counter()
+    for directory in untracked:
+        parts = directory.split(os.sep)
+        top = next(i for i in range(1, len(parts) + 1) if os.sep.join(parts[:i]) not in tracked)
+        if not any(part in SKIP for part in parts[top - 1:]):
+            kept.add(directory)
+            trees[os.sep.join(parts[:top])] += 1
+    ordered = sorted(kept, key=lambda d: (d.count(os.sep) if d else -1, d))
+    return [os.path.join(repo, d) if d else repo for d in ordered], trees
+
+def dormant(gitdirs, days):
+    """No commit, checkout, staging or reset within the period. Such repositories keep
+    their Git-state watches, which wake them, but no working-tree watches."""
+    if not days:
+        return False
+    newest = 0
+    for gitdir in gitdirs:
+        for name in ('index', 'HEAD', 'ORIG_HEAD', 'logs/HEAD'):
+            try:
+                newest = max(newest, os.stat(os.path.join(gitdir, name)).st_mtime)
+            except OSError:
+                pass
+    return time.time() - newest > days * 86400
 
 def git_directories(repo):
     known = globals().get('known_git_directories', {}).get(repo)
@@ -131,7 +158,7 @@ def linux():
     if fd < 0:
         raise OSError(ctypes.get_errno(), 'inotify_init1')
     mask = 0x2 | 0x4 | 0x8 | 0xC0 | 0x100 | 0x200 | 0x400 | 0x800
-    watches = {}  # wd -> (path, owning repositories, recursive)
+    watches = {}  # wd -> (path, owning repositories, kind: 'root', 'git', 'refs' or 'tree')
     budgets = {}
     anchors = set()
     failures = collections.Counter()
@@ -143,14 +170,17 @@ def linux():
             limit = max(1, int(f.read()) // 2)
     except OSError:
         limit = 8192
-    def watch(path, repo, recursive=False):
+    days = globals().get('active_days', 0)
+    sleeping = set()
+    wanted, trees = {}, {}
+    def watch(path, repo, kind):
         if len(watches) >= limit:
             failures['Repobot global watch budget'] += 1
             return False
         wd = libc.inotify_add_watch(fd, os.fsencode(path), mask | 0x01000000)
         if wd >= 0:
             if wd not in watches:
-                watches[wd] = (path, set(), recursive)
+                watches[wd] = (path, set(), kind)
             watches[wd][1].add(repo)
         if wd < 0:
             code = ctypes.get_errno()
@@ -158,12 +188,12 @@ def linux():
                 return True  # Vanished between listing and registration.
             failures[f'errno {code} ({os.strerror(code)})'] += 1
         return wd >= 0
-    def register(directories, repo, cap):
+    def register(directories, repo, cap, kind):
         seen = budgets.setdefault((repo, cap), set())
         for directory in directories:
             if directory in seen:
                 continue
-            if len(seen) >= cap or not watch(directory, repo, True):
+            if len(seen) >= cap or not watch(directory, repo, kind):
                 limited.add(repo)
                 break
             seen.add(directory)
@@ -174,23 +204,41 @@ def linux():
     for root in roots:
         path = os.path.expanduser(root)
         anchors.add(path)
-        watch(path, '')
+        watch(path, '', 'root')
     for repo in repos:
         # Git state needs only the gitdir itself (HEAD, index, packed-refs, FETCH_HEAD,
         # operation markers) and the ref hierarchy: never objects/ or logs/. Linked
         # worktrees have both a private gitdir and a shared common gitdir.
         for gitdir in git_directories(repo):
             anchors.add(gitdir)
-            if not watch(gitdir, repo):
+            if not watch(gitdir, repo, 'git'):
                 limited.add(repo)
             for name in ('refs', 'reftable'):
                 if os.path.isdir(os.path.join(gitdir, name)):
-                    register(walk(os.path.join(gitdir, name)), repo, 256)
+                    register(walk(os.path.join(gitdir, name)), repo, 256, 'refs')
     # Register every repository's Git metadata before working trees consume
     # the shared per-user watch budget. Other programs may already occupy it.
+    def work(repo):
+        directories, trees[repo] = work_directories(repo)
+        wanted[repo] = len(directories)
+        register(directories, repo, 2000, 'tree')
+    def usage():
+        # The heaviest repositories, and the untracked trees responsible, so the client
+        # can offer to fix an incomplete .gitignore.
+        held = collections.Counter()
+        for (repo, cap), seen in budgets.items():
+            held[repo] += len(seen)
+        emit('USAGE', json.dumps({
+            'total': len(watches), 'limit': limit * 2, 'dormant': len(sleeping),
+            'repos': [{'path': repo, 'watches': count, 'wanted': wanted.get(repo, 0),
+                       'untracked': [{'path': path, 'directories': n} for path, n in trees.get(repo, collections.Counter()).most_common(5)]}
+                      for repo, count in held.most_common(10)]}))
     for repo in repos:
         anchors.add(repo)
-        register(work_directories(repo), repo, 2000)
+        if dormant(git_directories(repo), days):
+            sleeping.add(repo)
+        else:
+            work(repo)
     detail = '; '.join(f'{reason}: {count}' for reason, count in sorted(failures.items()))
     coverage = f'{len(watches)} directory watches; {len(limited)} repositories limited; ' + (detail or 'per-repository budget reached')
     if not watches:
@@ -199,6 +247,7 @@ def linux():
     if limited or failures:
         emit('LIMIT', coverage)
     emit('READY')
+    usage()
     sources = [fd] + ([listener] if listener else [])
     while True:
         ready, _, _ = select.select(sources, [], [])
@@ -212,7 +261,7 @@ def linux():
             continue
         pos = 0
         changed = set()
-        reset = False
+        reset = reported = False
         while pos + 16 <= len(buf):
             wd, flags, cookie, length = struct.unpack_from('iIII', buf, pos)
             name = os.fsdecode(buf[pos+16:pos+16+length].split(b'\0')[0])
@@ -220,13 +269,22 @@ def linux():
             if flags & 0x4000:  # queue overflow
                 emit('RESCAN')
             if wd in watches:
-                path, owners, recursive = watches[wd]
+                path, owners, kind = watches[wd]
                 changed.update(owners)
-                if recursive and flags & 0x40000000 and flags & (0x100 | 0x80) and name not in SKIP:
+                woken = owners & sleeping if kind in ('git', 'refs') else ()
+                for owner in woken:  # Git activity: the repository is in use again.
+                    sleeping.discard(owner)
+                    work(owner)
+                # Ignore rules decide coverage; re-evaluate it when they change.
+                reset = reset or (kind == 'tree' and name == '.gitignore')
+                reported = reported or bool(woken)
+                if kind in ('refs', 'tree') and flags & 0x40000000 and flags & (0x100 | 0x80) and name not in SKIP:
                     created = os.path.join(path, name)
                     for owner in owners:
-                        if git(owner, 'check-ignore', '-q', created).returncode != 0:
-                            register(walk(created), owner, 2000)
+                        if kind == 'refs':
+                            register(walk(created), owner, 256, kind)
+                        elif git(owner, 'check-ignore', '-q', created).returncode != 0:
+                            register(walk(created), owner, 2000, kind)
                 if flags & 0x8000:
                     removed = watches.pop(wd)[0]
                     for seen in budgets.values():
@@ -235,6 +293,8 @@ def linux():
                     reset = reset or removed in anchors
         if reset:
             emit('RESET')
+        if reported:
+            usage()
         for repo in changed:
             emit('CHANGED', repo) if repo else emit('RESCAN')
 

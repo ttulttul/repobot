@@ -183,11 +183,13 @@ private struct SettingsDetailView: View {
   @SwiftUI.Environment(\.dismiss) private var dismiss
   @State private var draft: Configuration
   @State private var extraOptions: String
+  @State private var skipNames: String
   @State private var validationError: String?
   @State private var numericInput: [String: String] = [:]
   init(state: AppState, section: SettingsDetail) {
     self.state = state; self.section = section
     _draft = State(initialValue: state.configuration)
+    _skipNames = State(initialValue: state.configuration.effectiveWatchSkipNames.joined(separator: "\n"))
     _extraOptions = State(initialValue: state.configuration.extraSSHOptions.joined(separator: "\n"))
   }
   var body: some View {
@@ -223,6 +225,23 @@ private struct SettingsDetailView: View {
         }.labelsHidden()
       }
       Toggle("Check less often when idle on battery", isOn: $draft.batteryAware)
+      Divider()
+      number("Idle after", value: Binding(get: { draft.effectiveWatchActiveDays }, set: { draft.watchActiveDays = $0 }),
+             unit: "days without Git activity (0 watches every repository)")
+      Text("On Linux, every watched folder uses one of a limited number of filesystem watches. Idle repositories are still watched for commits, checkouts and fetches, and safety sweeps catch other edits.")
+        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+      VStack(alignment: .leading, spacing: 6) {
+        HStack {
+          Text("Never watch untracked folders named").font(.headline)
+          Spacer()
+          Button("Restore Defaults") { skipNames = Configuration.defaultWatchSkipNames.joined(separator: "\n") }
+            .disabled(Configuration.normalizedSkipNames(skipNames) == Configuration.defaultWatchSkipNames)
+        }
+        TextEditor(text: $skipNames).accessibilityLabel("Folder names that are never watched")
+          .font(.system(.body, design: .monospaced)).frame(height: 96).border(Color.secondary.opacity(0.2))
+        Text("One name per line. Folders that Git ignores are never watched; tracked folders always are.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
       if draft.upstreamCheck == .fetch {
         Text("Fetch writes remote-tracking refs in monitored repositories.").font(.caption).foregroundStyle(.orange)
       }
@@ -314,6 +333,7 @@ private struct SettingsDetailView: View {
       case "Uncommitted": validated.dirtyHours = value
       case "Unpushed": validated.unpushedHours = value
       case "Stale after": validated.staleBranchDays = value
+      case "Idle after": validated.watchActiveDays = value
       default: break
       }
     }
@@ -322,6 +342,9 @@ private struct SettingsDetailView: View {
             validated.safetyInterval.isFinite, validated.safetyInterval >= 30,
             validated.upstreamInterval.isFinite, validated.upstreamInterval >= 60 else {
         validationError = "Use at least 10 seconds for polling, 30 for safety sweeps, and 60 for upstream checks."; return
+      }
+      guard validated.effectiveWatchActiveDays.isFinite, (validated.watchActiveDays ?? 0) >= 0 else {
+        validationError = "Idle days must be zero or greater."; return
       }
     }
     if section == .findings {
@@ -339,6 +362,9 @@ private struct SettingsDetailView: View {
       next.upstreamInterval = validated.upstreamInterval
       next.upstreamCheck = validated.upstreamCheck
       next.batteryAware = validated.batteryAware
+      next.watchActiveDays = validated.watchActiveDays
+      let names = Configuration.normalizedSkipNames(skipNames)
+      next.watchSkipNames = names == Configuration.defaultWatchSkipNames ? nil : names
     case .notifications:
       next.notifications = validated.notifications
       next.notifyAttention = validated.notifyAttention
