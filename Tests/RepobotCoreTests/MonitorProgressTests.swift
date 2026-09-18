@@ -4,6 +4,7 @@ import Testing
 
 private actor ProgressTransport: Transport {
   let paths = (0..<12).map { "/repos/repo-\($0)" }
+  var closeCalls = 0
   var discoveryCalls = 0
   var baseBatches = 0
   var basePaths: [[String]] = []
@@ -42,10 +43,71 @@ private actor ProgressTransport: Transport {
   nonisolated func invocation(program: String, arguments: [String]) -> (String, [String]) {
     ("/usr/bin/false", [])
   }
-  func close() async {}
+  func close() async { closeCalls += 1 }
 }
 
 struct MonitorProgressTests {
+  @Test func oneTimeCheckWhilePausedPublishesWithoutWatchersOrTimers() async throws {
+    let root = try CoreTests().temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let transport = ProgressTransport()
+    var env = Environment(name: "Paused host", kind: .ssh, roots: ["/repos"])
+    var capabilities = Capabilities()
+    capabilities.python = true
+    env.capabilities = capabilities
+    var config = Configuration()
+    config.enabled = false
+    config.upstreamCheck = .off
+    config.environments = [env]
+    let store = StateStore(configuration: config, persistence: Persistence(directory: root))
+    let monitor = EnvironmentMonitor(environment: env, configuration: config, store: store, transport: transport)
+    let check = Task { await monitor.checkOnce(rescan: true) }
+    for _ in 0..<200 {
+      if await transport.baseBatches >= 2 { break }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(await transport.baseBatches == 2)
+    // Assert during the check, before stop() could hide an accidental timer.
+    #expect(await monitor.scheduledDeadline == nil)
+    #expect(await monitor.timerFirings == 0)
+    await transport.allowBase()
+    await check.value
+    let world = await store.world()
+    #expect(world.clones.count == 12)
+    #expect(world.clones.allSatisfy { $0.repo.headSHA == "new-tip" && $0.repo.awaitingFreshCheck != true })
+    #expect(world.environments.first?.lastCheckReason == "One-time check while paused")
+    #expect(world.environments.first?.checkProgress == nil)
+    #expect(await monitor.watcherStarts == 0)
+    #expect(await monitor.timerFirings == 0)
+    #expect(await monitor.scheduledDeadline == nil)
+    #expect(await transport.discoveryCalls == 1)
+    #expect(await transport.closeCalls == 1)
+  }
+
+  @Test func cancelledPausedCheckClosesTransportWithoutStartingMonitoring() async throws {
+    let root = try CoreTests().temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let transport = ProgressTransport()
+    var env = Environment(name: "Cancelled host", kind: .ssh, roots: ["/repos"])
+    env.capabilities = Capabilities()
+    var config = Configuration()
+    config.enabled = false; config.upstreamCheck = .off; config.environments = [env]
+    let store = StateStore(configuration: config, persistence: Persistence(directory: root))
+    let monitor = EnvironmentMonitor(environment: env, configuration: config, store: store, transport: transport)
+    let check = Task { await monitor.checkOnce() }
+    for _ in 0..<200 {
+      if await transport.baseBatches >= 2 { break }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(await transport.baseBatches == 2)
+    check.cancel()
+    await check.value
+    #expect(await transport.closeCalls == 1)
+    #expect(await monitor.scheduledDeadline == nil)
+    #expect(await monitor.watcherStarts == 0)
+    #expect(await store.world().environments.first?.checkProgress == nil)
+  }
+
   @Test(.enabled(if: ProcessInfo.processInfo.environment["REPOBOT_TEST_LIVE_MONITORS"] == "1"))
   func testConfiguredMachinesPublishBeforeUpstreamCompletes() async throws {
     let persistence = Persistence()

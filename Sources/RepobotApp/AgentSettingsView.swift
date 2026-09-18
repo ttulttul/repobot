@@ -2,18 +2,32 @@ import RepobotCore
 import SwiftUI
 
 @MainActor @Observable final class AgentSettingsStore {
-  var profiles: [AgentProfile] = []
+  private(set) var profiles: [AgentProfile] = []
   var availability: [UUID: AgentAvailability] = [:]
   var checking = false
   var error: String?
-  let persistence = Persistence()
-  init() {
+  let persistence: Persistence
+  init(persistence: Persistence = Persistence()) {
+    self.persistence = persistence
     do { profiles = try persistence.load([AgentProfile].self, from: "agents.json") ?? AgentProfile.defaults }
     catch { self.error = "Could not load coding-agent profiles: \(error.localizedDescription)" }
   }
-  func save() {
-    do { try persistence.save(profiles, to: "agents.json"); error = nil }
-    catch { self.error = error.localizedDescription }
+  @discardableResult func save(_ proposed: [AgentProfile]) -> Bool {
+    do { try persistence.save(proposed, to: "agents.json"); profiles = proposed; error = nil; return true }
+    catch { self.error = "Could not save coding-agent profiles: \(error.localizedDescription)"; return false }
+  }
+  @discardableResult func saveProfile(_ profile: AgentProfile) -> Bool {
+    var proposed = profiles
+    if let index = proposed.firstIndex(where: { $0.id == profile.id }) { proposed[index] = profile }
+    else { proposed.append(profile) }
+    guard save(proposed) else { return false }
+    availability[profile.id] = nil
+    return true
+  }
+  @discardableResult func remove(_ id: UUID) -> Bool {
+    guard save(profiles.filter { $0.id != id }) else { return false }
+    availability[id] = nil
+    return true
   }
   func refresh() async {
     guard !checking else { return }
@@ -22,8 +36,7 @@ import SwiftUI
     for profile in profiles { availability[profile.id] = await AgentCLI.availability(profile) }
   }
   func add(_ harness: AgentHarness) {
-    profiles.append(AgentProfile(name: "\(harness.title) account", harness: harness))
-    save()
+    saveProfile(AgentProfile(name: "\(harness.title) account", harness: harness))
   }
 }
 struct AgentSettingsView: View {
@@ -79,16 +92,13 @@ struct AgentSettingsView: View {
       Button("Cancel", role: .cancel) {}
       Button("Remove", role: .destructive) {
         guard let profile = selected else { return }
-        settings.profiles.removeAll { $0.id == profile.id }
-        settings.availability[profile.id] = nil
-        selection = settings.profiles.first?.id
-        settings.save()
+        if settings.remove(profile.id) { selection = settings.profiles.first?.id }
       }
     } message: { Text("This removes the Repobot profile. Your CLI login and account files are kept.") }
   }
   private func detail(_ profile: AgentProfile) -> some View {
     let status = settings.availability[profile.id]
-    return VStack(spacing: 24) {
+    return ScrollView { VStack(spacing: 24) {
       VStack(spacing: 12) {
         Image(systemName: "person.crop.circle").font(.system(size: 48, weight: .light)).foregroundStyle(.tint)
         Text(profile.name).font(.title2.bold())
@@ -116,9 +126,9 @@ struct AgentSettingsView: View {
       }
       Text("Uses your CLI login. Repobot stores profile settings, not credentials.")
         .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
-      if let error = settings.error ?? state.error { Text(error).font(.caption).foregroundStyle(.red).lineLimit(3) }
+      if let error = settings.error ?? state.error { OperationErrorView(message: error) }
       Spacer(minLength: 0)
-    }.padding(.horizontal, 24)
+    }.padding(.horizontal, 24).padding(.bottom, 24) }
   }
 }
 
@@ -127,52 +137,32 @@ private struct AgentProfileEditor: View {
   @State var profile: AgentProfile
   var saved: (UUID) -> Void
   @SwiftUI.Environment(\.dismiss) private var dismiss
-  @State private var advanced = false
   var body: some View {
     PreferencesDialog(title: "\(profile.harness.title) account", subtitle: "Give this login a name and choose the model used for new tasks.") {
       PreferenceRow(title: "Name") { TextField("Profile name", text: $profile.name).textFieldStyle(.roundedBorder) }
       PreferenceRow(title: "Model") { TextField("Harness default", text: $profile.model).textFieldStyle(.roundedBorder) }
       Text("Leave the model blank to use the CLI’s current default, or enter a model ID or alias.")
         .font(.caption).foregroundStyle(.secondary)
-      PreferenceRow(title: "CLI account") {
-        HStack {
-          Text(profile.homeDirectory.isEmpty ? "Default account" : "Custom account folder")
-          Spacer(); Button("Manage…") { advanced = true }
-        }
+      DisclosureGroup("Advanced Account Settings") {
+        VStack(alignment: .leading, spacing: 12) {
+          Text(profile.harness.homeVariable).font(.headline)
+          TextField("Default account folder", text: $profile.homeDirectory).textFieldStyle(.roundedBorder)
+            .accessibilityLabel("CLI account configuration folder")
+          Text("A custom folder creates a separate account profile. Use Log In / Repair after saving to sign in.")
+            .font(.caption).foregroundStyle(.secondary)
+          PreferenceRow(title: "CLI executable") {
+            TextField("Detect automatically", text: $profile.executable).textFieldStyle(.roundedBorder)
+              .accessibilityLabel("CLI executable path")
+          }
+        }.padding(.top, 10)
       }
-      if let error = settings.error { Text(error).font(.caption).foregroundStyle(.red).lineLimit(3) }
+      if let error = settings.error { OperationErrorView(message: error) }
     } actions: {
       Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
       Button("Save") {
-        if let index = settings.profiles.firstIndex(where: { $0.id == profile.id }) { settings.profiles[index] = profile }
-        else { settings.profiles.append(profile) }
-        settings.availability[profile.id] = nil
-        settings.save()
-        if settings.error == nil { saved(profile.id); dismiss(); Task { await settings.refresh() } }
+        if settings.saveProfile(profile) { saved(profile.id); dismiss(); Task { await settings.refresh() } }
       }.disabled(profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-    }.sheet(isPresented: $advanced) { AgentAccountEditor(profile: $profile) }
-  }
-}
-private struct AgentAccountEditor: View {
-  @Binding var profile: AgentProfile
-  @SwiftUI.Environment(\.dismiss) private var dismiss
-  @State private var home = ""
-  @State private var executable = ""
-  var body: some View {
-    PreferencesDialog(title: "CLI account", subtitle: "Use a separate configuration folder for each login.") {
-      Text(profile.harness.homeVariable).font(.headline)
-      TextField("Default account folder", text: $home).textFieldStyle(.roundedBorder)
-      Text("A custom folder creates a separate account profile. Use Log In / Repair after saving to sign in.")
-        .font(.caption).foregroundStyle(.secondary)
-      Divider()
-      Text("CLI executable").font(.headline)
-      TextField("Detect automatically", text: $executable).textFieldStyle(.roundedBorder)
-      Text("Leave blank to use the installed \(profile.harness.title) CLI.").font(.caption).foregroundStyle(.secondary)
-    } actions: {
-      Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-      Button("Done") { profile.homeDirectory = home; profile.executable = executable; dismiss() }
-        .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-    }.onAppear { home = profile.homeDirectory; executable = profile.executable }
+    }
   }
 }

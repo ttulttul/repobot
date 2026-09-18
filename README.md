@@ -14,15 +14,29 @@ Swift dependencies are required.
 open dist/Repobot.app
 ```
 
-The first launch opens Settings. Edit **This Mac** to choose root folders, then Save.
+The first launch opens **Environments** in Settings. Use **Choose Repository Folder…**
+on **This Mac** to start monitoring. Existing configurations keep their folders.
 
-Settings has three compact tabs: **Environments**, **Coding Agents**, and **Settings**.
-Select a machine or account to see its summary. **Edit…** and **Manage…** open focused
-modal sheets for deeper options; Cancel discards the draft. Adding an environment
+Settings has three native tabs: **Environments**, **Coding Agents**, and **General**.
+The menu and Command-Comma open the same window. Environment and account editors
+keep related fields in one sheet, with advanced sections collapsed. Save commits
+the draft only after it is written successfully; Cancel discards it. Adding an environment
 walks through choosing a device, connecting, and selecting repository folders.
 Repositories are discovered up to four folders below each root; the root itself is
 also checked. Use **Add Environment…** for SSH hosts. The menu can also be opened
 with **⇧⌘R** while a Repobot window is active.
+
+The build includes a layered `AppIcon.icon` for macOS 26+ when a working Xcode
+asset compiler is available; Xcode also generates a compatibility icon for older
+macOS. CLT-only or broken-Xcode builds explicitly fall back to the existing ICNS.
+Set `REPOBOT_LAYERED_ICON=1` to require layered compilation (and fail if unavailable),
+or `=0` to select the original ICNS. See [icon assets](assets/icons/README.md).
+
+**Check Now** also works while monitoring is paused: it performs one check and
+leaves continuous monitoring paused. Cached results remain labeled as last known
+state. **Restore Warnings** reverses Ignore from the repository detail window.
+Notification settings distinguish your preference from permission in System Settings;
+notifications covering multiple repositories open a map filtered to those repositories.
 
 The build script produces an ad-hoc signed local app. It does not install the app,
 register launch at login, or submit anything to Apple. Copy the finished app to
@@ -35,7 +49,7 @@ files. Set `REPOBOT_TOOLCHAIN_FALLBACK=0` to disable this fallback, or `=1` to f
 it; `REPOBOT_SDK` overrides that fallback SDK path. Local probes also use the
 standalone Command Line Tools when PATH would otherwise select Apple's Git shim.
 
-For an Xcode project:
+For an Xcode project (Xcode 26+ for the layered icon):
 
 ```sh
 brew install xcodegen  # if needed
@@ -68,7 +82,7 @@ initial configuration. `watch` is a local development harness.
 
 Open **Repository Map…** from the menu bar (or Shift-Command-M). Repobot groups
 copies under their normalized tracked remote URL, falling back to origin or the
-root commit. Search by repository or machine and use **Shared across machines**
+root commit. Press Command-F to search by repository or machine and use **Shared across machines**
 to show repositories present on more than one configured environment.
 
 Each copy shows its branch, commit, working-tree changes, stashes, and commits

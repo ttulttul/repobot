@@ -63,15 +63,13 @@ struct EnvironmentSettingsView: View {
       Button("Cancel", role: .cancel) {}
       Button("Remove", role: .destructive) {
         guard let env = selected, env.kind == .ssh else { return }
-        state.configuration.environments.removeAll { $0.id == env.id }
-        selection = state.configuration.environments.first?.id
-        state.save()
+        if state.removeEnvironment(env.id) { selection = state.configuration.environments.first?.id }
       }
     } message: { Text("Repobot will stop monitoring this machine. Its repositories are kept.") }
   }
   private func detail(_ env: RepobotCore.Environment) -> some View {
     let snapshot = state.world.environments.first { $0.id == env.id }
-    return VStack(spacing: 24) {
+    return ScrollView { VStack(spacing: 24) {
       VStack(spacing: 12) {
         Image(systemName: env.kind == .local ? "laptopcomputer" : "desktopcomputer")
           .font(.system(size: 42, weight: .light)).foregroundStyle(.tint)
@@ -84,10 +82,10 @@ struct EnvironmentSettingsView: View {
         }
         PreferenceRow(title: "Status") {
           HStack(alignment: .top, spacing: 7) {
-            Circle().fill(snapshot?.error != nil || snapshot?.reconnecting == true ? Color.orange : snapshot?.checkProgress != nil ? Color.blue : Color.green)
+            Circle().fill(env.roots.isEmpty || !state.configuration.enabled ? Color.secondary : snapshot?.error != nil || snapshot?.reconnecting == true ? Color.orange : snapshot?.checkProgress != nil ? Color.blue : Color.green)
               .frame(width: 8, height: 8).padding(.top, 4)
-            Text(snapshot?.error ?? snapshot?.checkProgress ?? (state.configuration.enabled ? snapshot?.mode ?? "Starting" : "Monitoring paused"))
-              .fixedSize(horizontal: false, vertical: true).lineLimit(3).textSelection(.enabled)
+            Text(env.roots.isEmpty ? "Choose repository folders to begin" : snapshot?.checkProgress ?? (!state.configuration.enabled ? "Monitoring paused" : snapshot?.error ?? snapshot?.mode ?? "Starting"))
+              .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
           }
         }
         PreferenceRow(title: "Monitoring") {
@@ -99,151 +97,171 @@ struct EnvironmentSettingsView: View {
           Text(snapshot?.checkedAt?.formatted(.relative(presentation: .named)) ?? "Not checked yet").foregroundStyle(.secondary)
         }
       }
+      if env.roots.isEmpty {
+        Text("Choose a repository folder to start monitoring this Mac.")
+          .foregroundStyle(.secondary)
+        Button("Choose Repository Folder…") { chooseRoot(for: env) }.buttonStyle(.borderedProminent)
+      }
       HStack(spacing: 10) {
         Button("Edit…") { state.edit(env) }
-        Button("Check Now") { state.check(env.id, rescan: true) }.disabled(state.checking || !state.configuration.enabled)
+        Button(state.checking ? "Checking…" : "Check Now") { state.check(env.id, rescan: true) }.disabled(state.checking || env.roots.isEmpty)
         Button("Open Terminal") { state.openTerminal(env) }
       }
-      if let error = state.error { Text(error).font(.caption).foregroundStyle(.red).lineLimit(3) }
+      if let error = state.error { OperationErrorView(message: error) }
       Spacer(minLength: 0)
-    }.padding(.horizontal, 24)
+    }.padding(.horizontal, 24).padding(.bottom, 24) }
   }
-}
-
-private enum EnvironmentDetail: String, Identifiable {
-  case roots = "Repository folders", connection = "SSH connection", monitoring = "Monitoring"
-  var id: String { rawValue }
-}
-struct EnvironmentEditor: View {
-  @Bindable var state: AppState
-  @State var environment: RepobotCore.Environment
-  @SwiftUI.Environment(\.dismiss) private var dismiss
-  @State private var detail: EnvironmentDetail?
-  @State private var error: String?
-  var body: some View {
-    PreferencesDialog(title: "Edit environment", subtitle: "Choose where Repobot looks for repositories.") {
-      PreferenceRow(title: "Name") { TextField("Name", text: $environment.name).textFieldStyle(.roundedBorder) }
-      row("Folders", summary: "\(environment.roots.count) repository root folders", destination: .roots)
-      if environment.kind == .ssh { row("Connection", summary: environment.host, destination: .connection) }
-      row("Monitoring", summary: environment.watchMode == .poll ? "Polling" : "Automatic events and safety checks", destination: .monitoring)
-      if let error = error ?? state.error { Text(error).font(.caption).foregroundStyle(.red).lineLimit(3) }
-    } actions: {
-      Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-      Button("Save") {
-        guard !environment.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !environment.roots.isEmpty else {
-          error = "Enter a name and at least one repository folder."; return
-        }
-        state.update(environment)
-        if state.error == nil { dismiss() }
-      }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-    }.sheet(item: $detail) { EnvironmentDetailView(state: state, environment: $environment, section: $0) }
-  }
-  private func row(_ title: String, summary: String, destination: EnvironmentDetail) -> some View {
-    PreferenceRow(title: title) {
-      HStack { Text(summary).lineLimit(2); Spacer(); Button("Manage…") { detail = destination } }
+  private func chooseRoot(for environment: RepobotCore.Environment) {
+    let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
+    panel.allowsMultipleSelection = true; panel.prompt = "Choose"
+    if panel.runModal() == .OK {
+      var draft = environment; draft.roots = panel.urls.map(\.path)
+      state.update(draft)
     }
   }
 }
 
-private struct EnvironmentDetailView: View {
+struct EnvironmentEditor: View {
   @Bindable var state: AppState
-  @Binding var environment: RepobotCore.Environment
-  let section: EnvironmentDetail
+  @State var environment: RepobotCore.Environment
   @SwiftUI.Environment(\.dismiss) private var dismiss
-  @State private var draft: RepobotCore.Environment
   @State private var roots: String
   @State private var interval: String
+  @State private var port: String
   @State private var status = ""
+  @State private var error: String?
   @State private var testing = false
+  @State private var testTask: Task<Void, Never>?
   @State private var resetTrust = false
-  init(state: AppState, environment: Binding<RepobotCore.Environment>, section: EnvironmentDetail) {
-    self.state = state; _environment = environment; self.section = section
-    _draft = State(initialValue: environment.wrappedValue)
-    _roots = State(initialValue: environment.wrappedValue.roots.joined(separator: "\n"))
-    _interval = State(initialValue: environment.wrappedValue.pollInterval.map { String(Int($0)) } ?? "")
+  init(state: AppState, environment: RepobotCore.Environment) {
+    self.state = state
+    _environment = State(initialValue: environment)
+    _roots = State(initialValue: environment.roots.joined(separator: "\n"))
+    _port = State(initialValue: environment.port.map(String.init) ?? "")
+    _interval = State(initialValue: environment.pollInterval.map { String(Int($0)) } ?? "")
   }
   var body: some View {
-    PreferencesDialog(title: section.rawValue, subtitle: draft.name) {
-      switch section {
-      case .roots:
-        Text("One folder per line. Repobot looks for repositories inside these folders.").foregroundStyle(.secondary)
-        TextEditor(text: $roots).font(.system(.body, design: .monospaced)).frame(height: 160)
-          .border(Color.secondary.opacity(0.2))
-        if draft.kind == .local {
-          Button("Choose folder…") {
+    PreferencesDialog(title: "Edit Environment", subtitle: "Changes take effect when you save.") {
+      PreferenceRow(title: "Name") { TextField("Name", text: $environment.name).textFieldStyle(.roundedBorder) }
+      VStack(alignment: .leading, spacing: 8) {
+        Text("Repository Folders").font(.headline)
+        Text("One folder per line. Repobot also searches inside these folders.").foregroundStyle(.secondary)
+        TextEditor(text: $roots).font(.system(.body, design: .monospaced)).frame(height: 110)
+          .accessibilityLabel("Repository root folders").border(Color.secondary.opacity(0.2))
+        if environment.kind == .local {
+          Button("Choose Folders…") {
             let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
-            if panel.runModal() == .OK, let path = panel.url?.path { roots += roots.isEmpty ? path : "\n" + path }
+            panel.allowsMultipleSelection = true
+            if panel.runModal() == .OK {
+              roots = ([roots].filter { !$0.isEmpty } + panel.urls.map(\.path)).joined(separator: "\n")
+            }
           }
         }
-      case .connection:
-        field("Host", text: $draft.host)
-        field("Username", text: $draft.user)
-        PreferenceRow(title: "Port") {
-          TextField("Port", value: Binding(get: { draft.port ?? 22 }, set: { draft.port = $0 }), format: .number)
-            .textFieldStyle(.roundedBorder).frame(width: 90)
-        }
-        field("Identity file", text: Binding(get: { draft.identityFile ?? "" }, set: { draft.identityFile = $0.isEmpty ? nil : $0 }))
-        Text("Leave the identity file blank to use your SSH configuration.").font(.caption).foregroundStyle(.secondary)
-        HStack {
-          Button(testing ? "Testing…" : "Test connection") { Task { await test() } }.disabled(testing)
-          Spacer()
-          Button("Reset host key trust…", role: .destructive) { resetTrust = true }
-        }
-      case .monitoring:
-        PreferenceRow(title: "Watch mode") {
-          Picker("Watch mode", selection: $draft.watchMode) {
-            Text("Automatic").tag(WatchMode.auto)
-            Text("Events").tag(WatchMode.events)
-            Text("Polling").tag(WatchMode.poll)
-          }.labelsHidden()
-        }
-        field("Poll seconds", text: $interval)
-        Text("Leave blank to use the global polling interval.").font(.caption).foregroundStyle(.secondary)
-        PreferenceRow(title: "Upstream") {
-          Picker("Upstream", selection: $draft.upstreamCheck) {
-            Text("Use global setting").tag(Optional<UpstreamCheck>.none)
-            Text("Read-only check").tag(Optional(UpstreamCheck.lsRemote))
-            Text("Fetch (updates tracking refs)").tag(Optional(UpstreamCheck.fetch))
-            Text("Off").tag(Optional(UpstreamCheck.off))
-          }.labelsHidden()
+      }
+      if environment.kind == .ssh {
+        DisclosureGroup("SSH Connection") {
+          VStack(alignment: .leading, spacing: 12) {
+            field("Host", text: $environment.host)
+            field("Username", text: $environment.user)
+            PreferenceRow(title: "Port") {
+              TextField("SSH default", text: $port).accessibilityLabel("SSH port, optional")
+                .textFieldStyle(.roundedBorder).frame(width: 90)
+            }
+            field("Identity file", text: Binding(get: { environment.identityFile ?? "" }, set: { environment.identityFile = $0.isEmpty ? nil : $0 }))
+            Text("Leave the identity file blank to use your SSH configuration.").font(.caption).foregroundStyle(.secondary)
+            HStack {
+              Button(testing ? "Testing…" : "Test Connection") { testTask = Task { await test() } }.disabled(testing)
+              Spacer()
+              Button("Reset Host Key Trust…", role: .destructive) { resetTrust = true }.disabled(testing)
+            }
+            if !status.isEmpty { Text(status).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
+          }.padding(.top, 10)
         }
       }
-      if !status.isEmpty { Text(status).font(.caption).textSelection(.enabled).lineLimit(4) }
+      DisclosureGroup("Advanced Monitoring") {
+        VStack(alignment: .leading, spacing: 12) {
+          PreferenceRow(title: "Watch mode") {
+            Picker("Watch mode", selection: $environment.watchMode) {
+              Text("Automatic").tag(WatchMode.auto); Text("Events").tag(WatchMode.events); Text("Polling").tag(WatchMode.poll)
+            }.labelsHidden()
+          }
+          field("Poll seconds", text: $interval)
+          Text("Use at least 10 seconds, or leave blank to use the global interval.").font(.caption).foregroundStyle(.secondary)
+          PreferenceRow(title: "Upstream") {
+            Picker("Upstream", selection: $environment.upstreamCheck) {
+              Text("Use global setting").tag(Optional<UpstreamCheck>.none)
+              Text("Read-only check").tag(Optional(UpstreamCheck.lsRemote))
+              Text("Fetch (updates tracking refs)").tag(Optional(UpstreamCheck.fetch))
+              Text("Off").tag(Optional(UpstreamCheck.off))
+            }.labelsHidden()
+          }
+          if environment.upstreamCheck == .fetch {
+            Label("Fetch updates remote-tracking refs in these repositories.", systemImage: "exclamationmark.triangle")
+          }
+        }.padding(.top, 10)
+      }
+      if let error = error ?? state.error { OperationErrorView(message: error) }
     } actions: {
-      Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-      Button("Done") {
-        draft.roots = roots.split(separator: "\n").map(String.init).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        guard !draft.roots.isEmpty else { status = "Choose at least one repository folder."; return }
-        if !interval.isEmpty && Double(interval) == nil { status = "Enter a number of seconds."; return }
-        if draft.kind == .ssh && (draft.host.isEmpty || !(1...65535).contains(draft.port ?? 22)) {
-          status = "Enter a host and a port between 1 and 65535."; return
-        }
-        draft.pollInterval = Double(interval).map { max(10, $0) }
-        environment = draft; dismiss()
-      }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(testing)
-    }.alert("Remove the trusted host key for \(draft.host)?", isPresented: $resetTrust) {
+      Button("Cancel") { testTask?.cancel(); dismiss() }.keyboardShortcut(.cancelAction)
+      Button("Save") { save() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent).disabled(testing)
+    }
+    .onDisappear { testTask?.cancel() }
+    .alert("Remove the trusted host key for \(environment.host)?", isPresented: $resetTrust) {
       Button("Cancel", role: .cancel) {}
-      Button("Reset trust", role: .destructive) {
-        Task {
-          let host = draft.port.map { "[\(draft.host)]:\($0)" } ?? draft.host
+      Button("Reset Trust", role: .destructive) {
+        guard let trustedEnvironment = connectionDraft(environment) else { return }
+        testTask = Task {
+          testing = true; defer { testing = false }
+          let host = trustedEnvironment.port.map { "[\(trustedEnvironment.host)]:\($0)" } ?? trustedEnvironment.host
           do {
             let result = try await ProcessRunner.run("/usr/bin/ssh-keygen", ["-R", host], timeout: 10)
             status = result.status == 0 ? "Trust reset. Verify the new fingerprint before continuing." : result.errorText
-          } catch { status = error.localizedDescription }
+          } catch { self.error = error.localizedDescription }
         }
       }
-    } message: { Text("Only do this after independently verifying why the host’s key changed.") }
+    } message: { Text("This changes SSH trust immediately, even if you later cancel editing. Only do this after independently verifying why the host’s key changed.") }
   }
   private func field(_ title: String, text: Binding<String>) -> some View {
     PreferenceRow(title: title) { TextField(title, text: text).textFieldStyle(.roundedBorder) }
   }
+  private func save() {
+    var proposed = environment
+    proposed.roots = Array(Set(roots.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })).sorted()
+    guard !proposed.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !proposed.roots.isEmpty else {
+      error = "Enter a name and at least one repository folder."; return
+    }
+    if !interval.isEmpty {
+      guard let seconds = Double(interval), seconds.isFinite, seconds >= 10 else {
+        error = "Enter at least 10 seconds, or leave the polling interval blank."; return
+      }
+    }
+    if proposed.kind == .ssh {
+      guard let connection = connectionDraft(proposed) else { return }
+      proposed = connection
+    }
+    proposed.pollInterval = Double(interval)
+    if state.update(proposed) { dismiss() }
+  }
+  private func connectionDraft(_ input: RepobotCore.Environment) -> RepobotCore.Environment? {
+    let value = port.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !input.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          value.isEmpty || Int(value).map({ (1...65535).contains($0) }) == true else {
+      error = "Enter a host and a port between 1 and 65535, or leave the port blank for your SSH default."
+      return nil
+    }
+    var proposed = input
+    proposed.port = Int(value)
+    error = nil
+    return proposed
+  }
   private func test() async {
+    guard let testedEnvironment = connectionDraft(environment) else { return }
     testing = true; defer { testing = false }
-    let transport = SSHTransport(environment: draft, configuration: state.configuration)
+    let transport = SSHTransport(environment: testedEnvironment, configuration: state.configuration)
     do {
-      draft.capabilities = try await Probe.capabilities(using: transport)
-      status = "Connected · \(draft.capabilities?.gitVersion ?? "")"
-    } catch { status = error.localizedDescription }
+      let capabilities = try await Probe.capabilities(using: transport)
+      if !Task.isCancelled { environment.capabilities = capabilities; status = "Connected · " + capabilities.gitVersion }
+    } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
     await transport.close()
   }
 }

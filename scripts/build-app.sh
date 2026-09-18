@@ -14,14 +14,20 @@ cp "$bin/RepobotApp" "$app/Contents/MacOS/RepobotApp"
 cp "$bin/repobot" "$app/Contents/MacOS/repobot"
 cp Sources/RepobotApp/Info.plist "$app/Contents/Info.plist"
 iconutil -c icns assets/icons/AppIcon.iconset -o "$app/Contents/Resources/AppIcon.icns"
+./scripts/compile-app-icon.sh "$app"
 cp assets/icons/MenuBarGlyph.svg "$app/Contents/Resources/MenuBarGlyph.svg"
 # Put script resources in the app's Resources directory; Scripts.load also supports
 # SwiftPM's generated bundle accessor for CLI and Xcode builds.
 rm -rf "$app/Contents/MacOS/Repobot_RepobotCore.bundle"
 rm -rf "$app/Contents/Resources/RepobotCore"
 mkdir -p "$app/Contents/Resources/RepobotCore"
+# SwiftPM's native and Swift Build backends use different macOS bundle layouts.
+resource_directory="$bin/Repobot_RepobotCore.bundle/Resources"
+if [[ ! -f "$resource_directory/probe.sh" ]]; then
+  resource_directory="$bin/Repobot_RepobotCore.bundle/Contents/Resources/Resources"
+fi
 for resource in probe.sh upstream.sh discover.sh capabilities.sh watcher.py; do
-  cp "$bin/Repobot_RepobotCore.bundle/Resources/$resource" "$app/Contents/Resources/RepobotCore/$resource"
+  cp "$resource_directory/$resource" "$app/Contents/Resources/RepobotCore/$resource"
 done
 codesign --force --deep --sign "${SIGN_IDENTITY:--}" --options runtime --entitlements Repobot.entitlements "$app"
 codesign --verify --deep --strict "$app"

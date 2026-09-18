@@ -17,6 +17,7 @@ public actor EnvironmentMonitor {
   private var discovered = Date.distantPast, swept = Date.distantPast,
     upstreamChecked = Date.distantPast
   private var lastHeartbeat = Date(), retryAt = Date.distantPast, backoff: Double = 5
+  private var oneShot = false
   private var busy = false, pending = false, stopped = true, forceDiscovery = false
   private var sweepQueued = false
   private(set) var timerFirings = 0
@@ -60,7 +61,7 @@ public actor EnvironmentMonitor {
   }
   private func scheduleTick() {
     loop?.cancel(); loop = nil; scheduledDeadline = nil
-    guard !stopped else { return }
+    guard !stopped, !oneShot else { return }
     let now = Date()
     let events = localWatcher != nil || remoteWatcher != nil
     let date = MonitorDeadline.next(now: now, busy: busy || sweepQueued, events: events,
@@ -100,8 +101,18 @@ public actor EnvironmentMonitor {
     forceDiscovery = forceDiscovery || rescan
     let task = Task { await self.sweep(full: true, forceUpstream: true, reason: reason) }
     activeSweep = task
-    await task.value
+    await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
     activeSweep = nil
+  }
+  /// A manual check while continuous monitoring is paused. No timers or watchers are started.
+  public func checkOnce(rescan: Bool = false) async {
+    guard stopped, !Task.isCancelled else { return }
+    oneShot = true
+    stopped = false
+    forceDiscovery = rescan
+    await sweep(full: true, forceUpstream: true, reason: "One-time check while paused")
+    await stop()
+    oneShot = false
   }
   public func wake() async {
     stopWatchers()
@@ -323,6 +334,7 @@ public actor EnvironmentMonitor {
     }
   }
   private func startWatcher() async {
+    if oneShot { snapshot.mode = "Manual check · monitoring paused"; return }
     defer { scheduleTick() }
     guard !stopped, environment.watchMode != .poll else {
       snapshot.mode = "Polling"

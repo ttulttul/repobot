@@ -29,7 +29,11 @@ struct AddEnvironmentView: View {
   var signature: String { "\(manual)|\(username)|\(key)" }
   @SwiftUI.Environment(\.dismiss) private var dismiss
   @State private var step = 0
-  @State private var connectionDetails = false
+  @State private var connectionTask: Task<Void, Never>?
+  @State private var scanTask: Task<Void, Never>?
+  @State private var refreshTask: Task<Void, Never>?
+  @State private var selectionTask: Task<Void, Never>?
+  private var validAddress: Bool { (try? HostDiscovery.parseManual(manual.trimmingCharacters(in: .whitespacesAndNewlines))) != nil }
   var body: some View {
     PreferencesDialog(title: ["Add environment", "Connect to machine", "Repository folders"][step],
                       subtitle: ["Choose a Tailscale device or enter an SSH address.",
@@ -39,9 +43,9 @@ struct AddEnvironmentView: View {
         HStack {
           Text("Available devices").font(.headline)
           Spacer()
-          Button(refreshing ? "Refreshing…" : "Refresh") { Task { await refreshTailscale() } }.disabled(refreshing)
+          Button(refreshing ? "Refreshing…" : "Refresh") { refreshTask = Task { await refreshTailscale() } }.disabled(refreshing)
           Menu { Button("Scan local network") { scanLAN() }.disabled(scanning) } label: { Image(systemName: "ellipsis.circle") }
-            .menuStyle(.borderlessButton).frame(width: 24)
+            .menuStyle(.borderlessButton).frame(width: 24).accessibilityLabel("Device discovery options")
         }
         List(hosts) { host in
           Button { select(host) } label: {
@@ -59,7 +63,8 @@ struct AddEnvironmentView: View {
             }.contentShape(Rectangle()).padding(.vertical, 5)
           }.buttonStyle(.plain)
         }.frame(height: 190)
-        TextField("Or enter user@host[:port]", text: $manual).textFieldStyle(.roundedBorder)
+        TextField("Or enter user@host[:port]", text: $manual).textFieldStyle(.roundedBorder).accessibilityLabel("SSH address")
+        if !manual.isEmpty && !validAddress { Text("Enter a host or user@host, with an optional port between 1 and 65535.").font(.caption) }
         Text(scanning ? "Scanning local network…" : !discoveryStatus.isEmpty ? discoveryStatus
              : !lanStatus.isEmpty ? lanStatus : "Tailscale devices appear without scanning.")
           .font(.caption).foregroundStyle(.secondary).lineLimit(3)
@@ -67,19 +72,28 @@ struct AddEnvironmentView: View {
         PreferenceRow(title: "Host") { Text(manual).textSelection(.enabled) }
         PreferenceRow(title: "Name") { TextField("Machine name", text: $name).textFieldStyle(.roundedBorder) }
         PreferenceRow(title: "Username") { TextField("Username", text: $username).textFieldStyle(.roundedBorder) }
-        PreferenceRow(title: "SSH identity") {
-          HStack {
-            Text(key.isEmpty ? "Use SSH configuration" : (key as NSString).lastPathComponent).lineLimit(1)
-            Spacer(); Button("Manage…") { connectionDetails = true }
-          }
+        DisclosureGroup("Advanced SSH Identity") {
+          VStack(alignment: .leading, spacing: 10) {
+            HStack {
+              TextField("Use SSH configuration", text: $key).textFieldStyle(.roundedBorder).accessibilityLabel("SSH identity file")
+              Button("Choose…") {
+                let panel = NSOpenPanel()
+                panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
+                panel.showsHiddenFiles = true
+                if panel.runModal() == .OK, let path = panel.url?.path { key = path.hasSuffix(".pub") ? String(path.dropLast(4)) : path }
+              }.accessibilityLabel("Choose SSH identity file")
+            }
+            Text("Leave blank to use your existing SSH keys and configuration. Passwords and passphrases are entered only in Terminal.")
+              .font(.caption).foregroundStyle(.secondary)
+          }.padding(.top, 10)
         }
         HStack {
           if testing { ProgressView().controlSize(.small) }
-          Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(3).textSelection(.enabled)
+          Text(status).font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
         }
         if capabilities == nil {
           Button("Install key in Terminal…") {
-            guard let env = try? HostDiscovery.parseManual(manual) else { return }
+            guard let env = try? HostDiscovery.parseManual(manual.trimmingCharacters(in: .whitespacesAndNewlines)) else { return }
             var args = ["ssh-copy-id"]
             if !key.isEmpty { args += ["-i", expandedPath(key) + ".pub"] }
             if let port = env.port { args += ["-p", String(port)] }
@@ -96,38 +110,40 @@ struct AddEnvironmentView: View {
             }))
           }.frame(height: min(150, CGFloat(capabilities.suggestedRoots.count * 32 + 12)))
         }
+        if !fingerprint.isEmpty {
+          DisclosureGroup("Trusted Host Key") {
+            Text(fingerprint).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+          }
+        }
         Text("Additional folders").font(.headline)
-        TextField("One folder per line", text: $customRoots, axis: .vertical).lineLimit(3...3).textFieldStyle(.roundedBorder)
-        if !status.hasPrefix("Connected") { Text(status).font(.caption).foregroundStyle(.secondary).lineLimit(3) }
+        TextField("One folder per line", text: $customRoots, axis: .vertical).accessibilityLabel("Additional repository folders").lineLimit(3...3).textFieldStyle(.roundedBorder)
+        if !status.hasPrefix("Connected") { Text(status).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
       }
     } actions: {
       Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
       if step > 0 { Button("Back") { step -= 1 }.disabled(testing) }
       Button(step == 2 ? "Add Environment" : testing ? "Connecting…" : "Continue") {
         if step == 0 {
-          if let parsed = try? HostDiscovery.parseManual(manual), manual.contains("@") { username = parsed.user }
+          if let parsed = try? HostDiscovery.parseManual(manual.trimmingCharacters(in: .whitespacesAndNewlines)), manual.contains("@") { username = parsed.user }
           status = "Ready to test the SSH connection"; step = 1
         } else if step == 1 {
-          Task { await test(); if capabilities != nil && checkedSignature == signature { step = 2 } }
+          connectionTask = Task { await test(); if !Task.isCancelled && capabilities != nil && checkedSignature == signature { step = 2 } }
         } else { addEnvironment() }
-      }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(manual.isEmpty || testing)
+      }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(!validAddress || testing)
     }
     .task { await refreshTailscale() }
     .onChange(of: signature) { _, _ in capabilities = nil; fingerprint = "" }
-    .sheet(isPresented: $connectionDetails) {
-      ConnectionIdentitySheet(key: $key, fingerprint: fingerprint)
-    }
+    .onDisappear { connectionTask?.cancel(); scanTask?.cancel(); refreshTask?.cancel(); selectionTask?.cancel() }
   }
   private func addEnvironment() {
     guard var env = selected, checkedSignature == signature, let capabilities else { return }
     env.name = name.isEmpty ? env.host : name
     env.user = username
     env.identityFile = key.isEmpty ? nil : key
-    env.roots = Array(Set(Array(roots) + customRoots.split(separator: "\n").map(String.init))).sorted()
+    env.roots = Array(Set(Array(roots) + customRoots.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })).sorted()
     env.capabilities = capabilities
     guard !env.roots.isEmpty else { status = "Select at least one root folder"; return }
-    state.add(env)
-    if state.error == nil { dismiss() } else { status = state.error ?? "Could not save environment" }
+    if state.add(env) { dismiss() } else { status = state.error ?? "Could not save environment" }
   }
   func select(_ host: DiscoveredHost) {
     let address = host.host.contains(":") ? "[\(host.host)]" : host.host
@@ -138,10 +154,11 @@ struct AddEnvironmentView: View {
     env.port = host.port
     env.tailscaleNodeID = host.nodeID
     selected = env
-    Task {
+    selectionTask?.cancel()
+    selectionTask = Task {
       let user = await HostDiscovery.configuredUser(
         for: host.host, sshPath: state.configuration.sshPath)
-      guard selected?.host == host.host else { return }
+      guard !Task.isCancelled, selected?.host == host.host else { return }
       username = user
     }
   }
@@ -161,11 +178,13 @@ struct AddEnvironmentView: View {
     guard !scanning else { return }
     scanning = true
     lanStatus = ""
-    Task {
+    scanTask = Task {
+      defer { scanning = false }
       async let network = HostDiscovery.discoverLAN()
       let bonjour = await BonjourDiscovery().discover()
       let verifiedBonjour = await HostDiscovery.scan(bonjour)
       let found = await network
+      guard !Task.isCancelled else { return }
       lanHosts = found + verifiedBonjour.filter { host in
         !found.contains { $0.host == host.host || $0.address == host.address }
       }
@@ -177,8 +196,9 @@ struct AddEnvironmentView: View {
     let requested = signature
     testing = true
     defer { testing = false }
+    var testedTransport: SSHTransport?
     do {
-      var env = try HostDiscovery.parseManual(manual)
+      var env = try HostDiscovery.parseManual(manual.trimmingCharacters(in: .whitespacesAndNewlines))
       if let previous = selected, previous.host == env.host {
         env.tailscaleNodeID = previous.tailscaleNodeID
       }
@@ -191,6 +211,7 @@ struct AddEnvironmentView: View {
       env.user = username
       env.identityFile = key.isEmpty ? nil : key
       let transport = SSHTransport(environment: env, configuration: state.configuration)
+      testedTransport = transport
       let cap = try await Probe.capabilities(using: transport)
       guard !Task.isCancelled, requested == signature else {
         await transport.close()
@@ -211,6 +232,7 @@ struct AddEnvironmentView: View {
       }
       await transport.close()
     } catch {
+      await testedTransport?.close()
       guard !Task.isCancelled, requested == signature else { return }
       capabilities = nil
       status = error.localizedDescription
@@ -218,35 +240,5 @@ struct AddEnvironmentView: View {
         state.configuration.debugLogging
           ? status : "SSH connection test failed (host details redacted)")
     }
-  }
-}
-
-private struct ConnectionIdentitySheet: View {
-  @Binding var key: String
-  let fingerprint: String
-  @SwiftUI.Environment(\.dismiss) private var dismiss
-  @State private var draft = ""
-  var body: some View {
-    PreferencesDialog(title: "SSH identity", subtitle: "Leave blank to use your existing SSH keys and configuration.") {
-      HStack {
-        TextField("Identity file", text: $draft).textFieldStyle(.roundedBorder)
-        Button("Choose…") {
-          let panel = NSOpenPanel()
-          panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
-          panel.showsHiddenFiles = true
-          if panel.runModal() == .OK, let path = panel.url?.path {
-            draft = path.hasSuffix(".pub") ? String(path.dropLast(4)) : path
-          }
-        }
-      }
-      if !fingerprint.isEmpty {
-        Text("Trusted host key").font(.headline)
-        Text(fingerprint).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-      }
-      Text("Passwords and key passphrases are entered only in Terminal.").font(.caption).foregroundStyle(.secondary)
-    } actions: {
-      Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-      Button("Done") { key = draft; dismiss() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-    }.onAppear { draft = key }
   }
 }

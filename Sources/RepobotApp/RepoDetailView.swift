@@ -8,14 +8,15 @@ struct RepoDetailView: View {
   var body: some View {
     if let clone, let env = state.world.environments.first(where: { $0.id == clone.environmentID })
     {
+      let freshness = state.freshness(for: clone)
       ScrollView {
         VStack(alignment: .leading, spacing: 20) {
           HStack(alignment: .top) {
             Image(
-              systemName: clone.status.severity >= .attention
+              systemName: !freshness.isCurrent ? freshness.symbol : clone.status.severity >= .attention
                 ? "exclamationmark.triangle.fill" : "checkmark.circle.fill"
             ).font(.largeTitle).foregroundStyle(
-              clone.status.severity == .problem
+              !freshness.isCurrent ? Color.secondary : clone.status.severity == .problem
                 ? .red : clone.status.severity == .attention ? .orange : .green)
             VStack(alignment: .leading) {
               Text(state.headline(for: clone)).font(.title2.bold())
@@ -24,10 +25,8 @@ struct RepoDetailView: View {
               ).textSelection(.enabled)
             }
           }
-          if let error = env.error {
-            Label("Last known state — \(error)", systemImage: "wifi.exclamationmark")
-              .foregroundStyle(.orange)
-          }
+          if let error = freshness.error { OperationErrorView(message: error) }
+          if let error = state.error { OperationErrorView(message: error) }
           GroupBox("Branch & upstream") {
             VStack(alignment: .leading, spacing: 8) {
               Text(
@@ -93,7 +92,7 @@ struct RepoDetailView: View {
                 HStack {
                   Text(command).font(.system(.body, design: .monospaced)).textSelection(.enabled)
                   Spacer()
-                  Button("Copy") { copyText(command) }
+                  Button("Copy") { copyText(command) }.accessibilityLabel("Copy command: " + command)
                 }
               }
             }
@@ -102,7 +101,7 @@ struct RepoDetailView: View {
             Button("Repository Map…") { state.showRepositoryMap() }
             Button("Ask an agent about these copies…") { state.showAgentReview(clone.status.identity) }
           }
-          HStack {
+          FlowLayout {
             Button("Open in Terminal") {
               state.openTerminal(env.environment, path: clone.repo.path)
             }
@@ -111,7 +110,7 @@ struct RepoDetailView: View {
                 NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: clone.repo.path)
               }
             }
-            Button("Re-check") { state.check(clone.environmentID) }
+            Button(state.checking ? "Checking…" : "Check Now") { state.check(clone.environmentID) }.disabled(state.checking)
             Menu("Snooze") {
               Button("1 hour") { state.snooze(clone, until: Date().addingTimeInterval(3600)) }
               Button("Until tomorrow") {
@@ -121,11 +120,14 @@ struct RepoDetailView: View {
                     86400 + 8 * 3600))
               }
               Button("Resume warnings") {
-                state.configuration.snoozed[clone.id] = nil
-                state.save()
+                state.resumeWarnings(clone)
               }
             }
-            Button("Ignore repo") { state.ignore(clone) }
+            if state.configuration.ignored.contains(clone.id) {
+              Button("Restore Warnings") { state.resumeWarnings(clone) }
+            } else {
+              Button("Ignore Repository") { state.ignore(clone) }
+            }
           }
         }.padding(24)
       }.frame(minWidth: 620, minHeight: 460)

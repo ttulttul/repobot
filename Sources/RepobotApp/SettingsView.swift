@@ -2,7 +2,10 @@ import RepobotCore
 import ServiceManagement
 import SwiftUI
 
-enum SettingsTab: Hashable { case environments, agents, general }
+enum SettingsTab: String, Hashable {
+  case environments, agents, general
+  var title: String { switch self { case .environments: "Environments"; case .agents: "Coding Agents"; case .general: "General" } }
+}
 enum EnvironmentSheet: Identifiable {
   case add, edit(RepobotCore.Environment)
   var id: String {
@@ -10,7 +13,7 @@ enum EnvironmentSheet: Identifiable {
   }
 }
 
-// Small, aligned rows and focused sheets keep the main preferences window calm.
+// Aligned fields within the focused settings editors.
 struct PreferenceRow<Content: View>: View {
   let title: String
   @ViewBuilder var content: Content
@@ -32,7 +35,10 @@ struct PreferencesDialog<Content: View, Actions: View>: View {
         Text(title).font(.title2.bold())
         if !subtitle.isEmpty { Text(subtitle).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
       }.padding(24)
-      VStack(alignment: .leading, spacing: 18) { content }.padding(.horizontal, 24).padding(.bottom, 24)
+      ScrollView {
+        VStack(alignment: .leading, spacing: 18) { content }
+          .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 24)
+      }.frame(maxHeight: 440)
       Divider()
       HStack { Spacer(); actions }.padding(16)
     }.frame(width: 580)
@@ -42,36 +48,45 @@ struct PreferencesDialog<Content: View, Actions: View>: View {
 struct SettingsView: View {
   @Bindable var state: AppState
   var body: some View {
-    VStack(spacing: 0) {
-      HStack(spacing: 8) {
-        tab("Environments", image: "desktopcomputer", selection: .environments)
-        tab("Coding Agents", image: "person.crop.circle", selection: .agents)
-        tab("Settings", image: "slider.horizontal.3", selection: .general)
-      }.padding(10).frame(maxWidth: .infinity).background(.bar)
-      Divider()
-      switch state.settingsTab {
-      case .environments: EnvironmentSettingsView(state: state)
-      case .agents: AgentSettingsView(state: state, settings: state.agents)
-      case .general: GeneralSettingsView(state: state)
+    TabView(selection: $state.settingsTab) {
+      EnvironmentSettingsView(state: state)
+        .tabItem { Label("Environments", systemImage: "desktopcomputer") }.tag(SettingsTab.environments)
+      AgentSettingsView(state: state, settings: state.agents)
+        .tabItem { Label("Coding Agents", systemImage: "person.crop.circle") }.tag(SettingsTab.agents)
+      GeneralSettingsView(state: state)
+        .tabItem { Label("General", systemImage: "slider.horizontal.3") }.tag(SettingsTab.general)
+    }
+    .frame(width: 760, height: 500)
+    .background(SettingsWindowConfiguration(title: state.settingsTab.title))
+    .sheet(item: $state.environmentSheet) { sheet in
+      switch sheet {
+      case .add: AddEnvironmentView(state: state)
+      case .edit(let env): EnvironmentEditor(state: state, environment: env)
       }
-    }.frame(minWidth: 760, minHeight: 540)
-      .sheet(item: $state.environmentSheet) { sheet in
-        switch sheet {
-        case .add: AddEnvironmentView(state: state)
-        case .edit(let env): EnvironmentEditor(state: state, environment: env)
-        }
-      }
+    }
+    .onChange(of: state.settingsTab) { _, tab in
+      UserDefaults.standard.set(tab.rawValue, forKey: "selectedSettingsPane")
+    }
   }
-  private func tab(_ title: String, image: String, selection: SettingsTab) -> some View {
-    let selected = state.settingsTab == selection
-    return Button { state.settingsTab = selection } label: {
-      VStack(spacing: 6) {
-        Image(systemName: image).font(.system(size: 25, weight: .regular))
-        Text(title).font(.system(size: 12, weight: selected ? .medium : .regular))
-      }.frame(width: 104, height: 60)
-        .foregroundStyle(selected ? Color.accentColor : .secondary)
-        .background(selected ? Color(nsColor: .controlBackgroundColor) : .clear, in: RoundedRectangle(cornerRadius: 10))
-    }.buttonStyle(.plain).accessibilityLabel(title).accessibilityValue(selected ? "Selected" : "")
+}
+
+/// Configure the scene's existing window; never create a second Settings window.
+private struct SettingsWindowConfiguration: NSViewRepresentable {
+  let title: String
+  func makeNSView(context: Context) -> NSView { SettingsWindowAnchor() }
+  func updateNSView(_ nsView: NSView, context: Context) {
+    (nsView as? SettingsWindowAnchor)?.paneTitle = title
+  }
+}
+private final class SettingsWindowAnchor: NSView {
+  var paneTitle = "General" { didSet { configure() } }
+  override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); configure() }
+  private func configure() {
+    guard let window else { return }
+    window.title = paneTitle
+    window.standardWindowButton(.miniaturizeButton)?.isEnabled = false
+    window.standardWindowButton(.zoomButton)?.isEnabled = false
+    window.toolbar?.allowsUserCustomization = false
   }
 }
 
@@ -80,13 +95,22 @@ private struct GeneralSettingsView: View {
   @State private var loginEnabled = SMAppService.mainApp.status == .enabled
   @State private var detail: SettingsDetail?
   var body: some View {
-    VStack(alignment: .leading, spacing: 26) {
-      PreferenceRow(title: "General") {
-        VStack(alignment: .leading, spacing: 12) {
-          Toggle("Monitor repositories", isOn: Binding(get: { state.configuration.enabled }, set: {
-            state.configuration.enabled = $0; state.save()
-          }))
-          Toggle("Launch Repobot at login", isOn: $loginEnabled).onChange(of: loginEnabled) { _, enabled in
+    Form {
+      Section("Startup & monitoring") {
+        Toggle(isOn: Binding(get: { state.configuration.enabled }, set: {
+          let enabled = $0
+          state.changeConfiguration { $0.enabled = enabled }
+        })) {
+          VStack(alignment: .leading, spacing: 4) {
+            Text("Monitor repositories")
+            Text("Continuously watch configured repositories for changes.")
+              .font(.callout).foregroundStyle(.secondary)
+          }
+        }
+        .accessibilityLabel("Monitor repositories")
+        .accessibilityHint("Continuously watch configured repositories for changes")
+        Toggle("Launch Repobot at login", isOn: $loginEnabled)
+          .onChange(of: loginEnabled) { _, enabled in
             do {
               if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
             } catch {
@@ -94,29 +118,57 @@ private struct GeneralSettingsView: View {
               loginEnabled = SMAppService.mainApp.status == .enabled
             }
           }
-        }
       }
-      managed("Checks", summary: "Events with periodic safety checks", detail: .checks)
-      managed("Notifications", summary: state.configuration.notifications ? "Enabled" : "Off", detail: .notifications)
-      managed("Findings", summary: "Choose what needs your attention", detail: .findings)
-      managed("Hidden findings", summary: "\(state.configuration.ignored.count) ignored · \(state.configuration.snoozed.count) snoozed", detail: .hidden)
-      managed("SSH", summary: "Use your SSH keys and configuration", detail: .ssh)
-      managed("Diagnostics", summary: "Logs and configuration files", detail: .diagnostics)
+      .toggleStyle(.switch)
+
+      Section("Monitoring") {
+        destination("Checks", summary: "Events with periodic safety checks", detail: .checks)
+        destination("Notifications", summary: state.notificationSummary, detail: .notifications)
+        destination("Findings", summary: "Choose what needs your attention", detail: .findings)
+        destination("Hidden Findings", summary: "\(state.configuration.ignored.count) ignored · \(state.configuration.snoozed.count) snoozed",
+                    detail: .hidden, inlineSummary: true)
+      }
+
+      Section("System") {
+        destination("SSH", summary: "Uses your SSH keys and configuration", detail: .ssh)
+        destination("Diagnostics", summary: "Logs and configuration files", detail: .diagnostics)
+      }
+
       if let error = state.error {
-        Text(error).font(.caption).foregroundStyle(.red).lineLimit(3).textSelection(.enabled)
-      }
-      Spacer(minLength: 0)
-    }.padding(.horizontal, 32).padding(.top, 34).padding(.bottom, 16)
-      .sheet(item: $detail) { SettingsDetailView(state: state, section: $0) }
-  }
-  private func managed(_ label: String, summary: String, detail: SettingsDetail) -> some View {
-    PreferenceRow(title: label) {
-      HStack {
-        Text(summary).lineLimit(2)
-        Spacer(minLength: 12)
-        Button("Manage…") { self.detail = detail }.frame(width: 90)
+        Section { OperationErrorView(message: error) }
       }
     }
+    .formStyle(.grouped)
+    .sheet(item: $detail) { SettingsDetailView(state: state, section: $0) }
+  }
+
+  private func destination(_ title: String, summary: String, detail: SettingsDetail,
+                           inlineSummary: Bool = false) -> some View {
+    Button { self.detail = detail } label: {
+      HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: 4) {
+          Text(title).foregroundStyle(.primary)
+          if !inlineSummary {
+            Text(summary).font(.callout).foregroundStyle(.secondary)
+              .fixedSize(horizontal: false, vertical: true)
+          }
+        }
+        Spacer(minLength: 12)
+        if inlineSummary {
+          Text(summary).font(.callout).foregroundStyle(.secondary)
+        }
+        Image(systemName: "chevron.right")
+          .font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+          .accessibilityHidden(true)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.vertical, 4)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .accessibilityLabel(title)
+    .accessibilityValue(summary)
+    .accessibilityHint("Opens " + title.lowercased())
   }
 }
 
@@ -131,6 +183,8 @@ private struct SettingsDetailView: View {
   @SwiftUI.Environment(\.dismiss) private var dismiss
   @State private var draft: Configuration
   @State private var extraOptions: String
+  @State private var validationError: String?
+  @State private var numericInput: [String: String] = [:]
   init(state: AppState, section: SettingsDetail) {
     self.state = state; self.section = section
     _draft = State(initialValue: state.configuration)
@@ -139,7 +193,7 @@ private struct SettingsDetailView: View {
   var body: some View {
     PreferencesDialog(title: section.rawValue, subtitle: subtitle) {
       fields
-      if let error = state.error { Text(error).font(.caption).foregroundStyle(.red).lineLimit(3) }
+      if let error = validationError ?? state.error { OperationErrorView(message: error) }
     } actions: {
       Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
       Button("Done") { save() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
@@ -158,9 +212,9 @@ private struct SettingsDetailView: View {
   @ViewBuilder private var fields: some View {
     switch section {
     case .checks:
-      number("Polling", value: $draft.pollInterval, unit: "seconds")
-      number("Safety sweep", value: $draft.safetyInterval, unit: "seconds")
-      number("Upstream", value: $draft.upstreamInterval, unit: "seconds")
+      number("Polling", value: $draft.pollInterval, unit: "seconds (minimum 10)")
+      number("Safety sweep", value: $draft.safetyInterval, unit: "seconds (minimum 30)")
+      number("Upstream", value: $draft.upstreamInterval, unit: "seconds (minimum 60)")
       PreferenceRow(title: "Method") {
         Picker("Upstream method", selection: $draft.upstreamCheck) {
           Text("Read-only check").tag(UpstreamCheck.lsRemote)
@@ -173,6 +227,11 @@ private struct SettingsDetailView: View {
         Text("Fetch writes remote-tracking refs in monitored repositories.").font(.caption).foregroundStyle(.orange)
       }
     case .notifications:
+      if state.notificationAuthorization == .denied {
+        Label("Notifications are blocked in System Settings.", systemImage: "bell.slash")
+        Button("Open Notification Settings…") { state.openNotificationSettings() }
+        Text("Choose Repobot in System Settings → Notifications to allow notifications.").font(.caption).foregroundStyle(.secondary)
+      }
       Toggle("Notify when repositories need attention", isOn: $draft.notifications)
       HStack(spacing: 24) {
         Toggle("Attention", isOn: $draft.notifyAttention)
@@ -208,7 +267,7 @@ private struct SettingsDetailView: View {
     case .ssh:
       TextField("SSH executable", text: $draft.sshPath).textFieldStyle(.roundedBorder)
       Text("Extra SSH options").font(.headline)
-      TextEditor(text: $extraOptions).font(.system(.body, design: .monospaced)).frame(height: 110)
+      TextEditor(text: $extraOptions).accessibilityLabel("Extra SSH options").font(.system(.body, design: .monospaced)).frame(height: 110)
         .border(Color.secondary.opacity(0.2))
       Text("One key=value option per line.").font(.caption).foregroundStyle(.secondary)
     case .diagnostics:
@@ -224,7 +283,10 @@ private struct SettingsDetailView: View {
   private func number(_ title: String, value: Binding<Double>, unit: String) -> some View {
     PreferenceRow(title: title) {
       HStack {
-        TextField(title, value: value, format: .number).textFieldStyle(.roundedBorder).frame(width: 76)
+        TextField(title, text: Binding(
+          get: { numericInput[title] ?? value.wrappedValue.formatted(.number.grouping(.never)) },
+          set: { numericInput[title] = $0 }
+        )).textFieldStyle(.roundedBorder).frame(width: 76)
         Text(unit).foregroundStyle(.secondary)
       }
     }
@@ -235,40 +297,81 @@ private struct SettingsDetailView: View {
         Text(id.components(separatedBy: ":").dropFirst().joined(separator: ":")).lineLimit(2)
         Text(kind).font(.caption).foregroundStyle(.secondary)
       }
-      Spacer(); Button("Restore", action: restore)
+      Spacer(); Button("Restore", action: restore).accessibilityLabel("Restore warnings for " + id.components(separatedBy: ":").dropFirst().joined(separator: ":"))
     }
   }
   private func save() {
-    let requestNotifications = section == .notifications && draft.notifications && !state.configuration.notifications
+    validationError = nil
+    var validated = draft
+    for (title, text) in numericInput {
+      guard let value = SettingsNumber.parse(text), value.isFinite else {
+        validationError = "Enter a number for \(title.lowercased())."; return
+      }
+      switch title {
+      case "Polling": validated.pollInterval = value
+      case "Safety sweep": validated.safetyInterval = value
+      case "Upstream": validated.upstreamInterval = value
+      case "Uncommitted": validated.dirtyHours = value
+      case "Unpushed": validated.unpushedHours = value
+      case "Stale after": validated.staleBranchDays = value
+      default: break
+      }
+    }
+    if section == .checks {
+      guard validated.pollInterval.isFinite, validated.pollInterval >= 10,
+            validated.safetyInterval.isFinite, validated.safetyInterval >= 30,
+            validated.upstreamInterval.isFinite, validated.upstreamInterval >= 60 else {
+        validationError = "Use at least 10 seconds for polling, 30 for safety sweeps, and 60 for upstream checks."; return
+      }
+    }
+    if section == .findings {
+      guard validated.dirtyHours.isFinite, validated.dirtyHours >= 0, validated.unpushedHours.isFinite, validated.unpushedHours >= 0,
+            validated.staleBranchDays.isFinite, validated.staleBranchDays >= 1 else {
+        validationError = "Warning ages must be zero or greater; stale branches require at least one day."; return
+      }
+    }
+    let requestNotifications = section == .notifications && validated.notifications
+    var next = state.configuration
     switch section {
     case .checks:
-      state.configuration.pollInterval = draft.pollInterval
-      state.configuration.safetyInterval = draft.safetyInterval
-      state.configuration.upstreamInterval = draft.upstreamInterval
-      state.configuration.upstreamCheck = draft.upstreamCheck
-      state.configuration.batteryAware = draft.batteryAware
+      next.pollInterval = validated.pollInterval
+      next.safetyInterval = validated.safetyInterval
+      next.upstreamInterval = validated.upstreamInterval
+      next.upstreamCheck = validated.upstreamCheck
+      next.batteryAware = validated.batteryAware
     case .notifications:
-      state.configuration.notifications = draft.notifications
-      state.configuration.notifyAttention = draft.notifyAttention
-      state.configuration.notifyProblem = draft.notifyProblem
-      state.configuration.quietHours = draft.quietHours
-      state.configuration.quietStart = draft.quietStart
-      state.configuration.quietEnd = draft.quietEnd
+      next.notifications = validated.notifications
+      next.notifyAttention = validated.notifyAttention
+      next.notifyProblem = validated.notifyProblem
+      next.quietHours = validated.quietHours
+      next.quietStart = validated.quietStart
+      next.quietEnd = validated.quietEnd
     case .findings:
-      state.configuration.dirtyHours = draft.dirtyHours
-      state.configuration.unpushedHours = draft.unpushedHours
-      state.configuration.disabledFindings = draft.disabledFindings
-      state.configuration.reportStaleBranches = draft.reportStaleBranches
-      state.configuration.staleBranchDays = draft.staleBranchDays
+      next.dirtyHours = validated.dirtyHours
+      next.unpushedHours = validated.unpushedHours
+      next.disabledFindings = validated.disabledFindings
+      next.reportStaleBranches = validated.reportStaleBranches
+      next.staleBranchDays = validated.staleBranchDays
     case .hidden:
-      state.configuration.ignored = draft.ignored; state.configuration.snoozed = draft.snoozed
+      next.ignored = validated.ignored; next.snoozed = validated.snoozed
     case .ssh:
-      state.configuration.sshPath = draft.sshPath
-      state.configuration.extraSSHOptions = extraOptions.split(separator: "\n").map(String.init)
-    case .diagnostics: state.configuration.debugLogging = draft.debugLogging
+      next.sshPath = validated.sshPath
+      next.extraSSHOptions = extraOptions.split(separator: "\n").map(String.init)
+    case .diagnostics: next.debugLogging = validated.debugLogging
     }
-    state.save()
-    if requestNotifications { state.requestNotifications() }
-    if state.error == nil { dismiss() }
+    if state.save(next) {
+      if requestNotifications { state.requestNotifications() }
+      dismiss()
+    }
+  }
+}
+
+/// Reject incomplete numeric input rather than silently retaining the old setting.
+enum SettingsNumber {
+  static func parse(_ text: String, locale: Locale = .current) -> Double? {
+    let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      .replacingOccurrences(of: locale.decimalSeparator ?? ".", with: ".")
+    guard let value = Double(normalized), value.isFinite else { return nil }
+    return value
   }
 }

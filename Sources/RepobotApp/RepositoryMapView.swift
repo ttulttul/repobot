@@ -16,9 +16,14 @@ struct RepositoryMapView: View {
           if let group = model.selectedGroup {
             RepositoryMapGroupView(state: state, group: group).id(group.id)
           } else {
-            ContentUnavailableView("No matching repositories", systemImage: "folder",
-              description: Text("Change your search or filter, or add repository roots in Settings."))
-              .frame(maxWidth: .infinity, maxHeight: .infinity)
+            ContentUnavailableView {
+              Label("No Matching Repositories", systemImage: "folder")
+            } description: {
+              Text(model.notificationCloneIDs == nil ? "Change your search or filter, or choose a repository folder." : "These repositories are no longer available. Show all repositories or review your environments.")
+            } actions: {
+              Button("Choose Repository Folders…") { state.showSetup() }
+              if model.notificationCloneIDs != nil { Button("Show All Repositories") { model.clearNotificationFilter() } }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
           }
         }
         .frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
@@ -32,39 +37,35 @@ struct RepositoryMapView: View {
 private struct RepositoryMapHeader: View {
   let state: AppState
   var body: some View {
-    HStack {
+    VStack(alignment: .leading, spacing: 10) { HStack {
       Text("Repository Map").font(.title2.bold())
       Spacer()
       if !state.configuration.enabled {
         Label("Monitoring paused · Last known state", systemImage: "pause.circle")
           .font(.callout).foregroundStyle(.orange)
       }
-      Button(state.checking ? "Checking…" : "Refresh all") { state.check(rescan: true) }
-        .disabled(state.checking || !state.configuration.enabled)
+      Button(state.checking ? "Checking…" : "Refresh All") { state.check(rescan: true) }
+        .disabled(state.checking)
+    }
+      if let error = state.error { OperationErrorView(message: error) }
     }.padding(.horizontal, 22).padding(.vertical, 16)
   }
 }
 
 private struct RepositoryMapSidebar: View {
   @Bindable var model: RepositoryMapModel
-  @FocusState private var searchFocused: Bool
 
   var body: some View {
     VStack(spacing: 0) {
       VStack(alignment: .leading, spacing: 12) {
-        HStack(spacing: 6) {
-          Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-          TextField("Search repositories", text: $model.search)
-            .textFieldStyle(.plain).focused($searchFocused)
-            .help("Search by repository, path, or machine")
-          if !model.search.isEmpty {
-            Button { model.search = "" } label: {
-              Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-            }.buttonStyle(.plain).help("Clear search").accessibilityLabel("Clear search")
+        RepositorySearchField(text: $model.search, focusRequested: $model.focusSearch)
+          .frame(height: 28)
+        if model.notificationCloneIDs != nil {
+          VStack(alignment: .leading, spacing: 5) {
+            Text("Repositories from notification").font(.caption)
+            Button("Show All Repositories") { model.clearNotificationFilter() }
           }
         }
-        .padding(8)
-        .background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
         Toggle("Shared across machines", isOn: $model.sharedOnly)
           .toggleStyle(.checkbox).font(.callout)
       }.padding(14)
@@ -86,7 +87,7 @@ private struct RepositoryMapSidebar: View {
         .frame(maxWidth: .infinity, alignment: .leading).padding(14)
     }
     .background {
-      Button("Find repository") { searchFocused = true }
+      Button("Find Repository") { model.focusSearch = true }
         .keyboardShortcut("f", modifiers: .command).hidden()
     }
   }
@@ -169,7 +170,8 @@ private struct RepositoryMapGroupView: View {
                   systemImage: "clock.badge.exclamationmark")
               .font(.caption).foregroundStyle(.orange)
           }
-          Button("Ask an agent…") { state.showAgentReview(group.id) }
+          Button("Ask an Agent…") { state.showAgentReview(group.id) }
+            .accessibilityLabel("Ask an agent about " + group.title)
         }
         .padding(16).frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
@@ -217,7 +219,7 @@ private struct RepositoryMapCopyView: View {
         Text("\(repo.branch ?? "Detached HEAD") · \(repo.headSHA.isEmpty ? "No commits" : String(repo.headSHA.prefix(8)))")
           .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
         let signals = Analyzer.workSignals(repo)
-        Text(signals.isEmpty ? "Working tree clean · no pending pushes detected" : signals.joined(separator: " · "))
+        Text((content.unverified || !state.configuration.enabled ? "Last known: " : "") + (signals.isEmpty ? "Working tree clean · no pending pushes detected" : signals.joined(separator: " · ")))
           .font(.callout)
         if let upstream = repo.upstream {
           Text("Tracks \(upstream) · \(repo.ahead) ahead / \(repo.behind) behind last fetched state")
@@ -232,6 +234,7 @@ private struct RepositoryMapCopyView: View {
         RepositoryAgeView(age: row.age, lastCommitDate: repo.headSHA.isEmpty ? nil : repo.lastCommitDate, detailed: true)
         RepositoryMapCheckedTime(row: row).font(.caption2).foregroundStyle(.secondary)
         Button("Details…") { state.showDetail(row.clone) }
+          .accessibilityLabel("Details for " + (repo.path as NSString).lastPathComponent + " on " + content.environmentName)
       }
       .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 10)
     } label: {
@@ -242,10 +245,10 @@ private struct RepositoryMapCopyView: View {
           Text(repo.branch ?? "Detached HEAD").font(.system(.caption, design: .monospaced))
             .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
         }
-        if content.unverified {
-          Label(content.unavailable ? "Unavailable · Last known state" : "Awaiting fresh check · Last known state",
-                systemImage: "clock.badge.exclamationmark")
-            .font(.caption).foregroundStyle(.orange)
+        if content.unverified || !state.configuration.enabled {
+          RepositoryFreshnessView(freshness: RepositoryFreshness(paused: !state.configuration.enabled,
+            pending: !content.unavailable, error: content.unavailable ? (repo.error ?? "This machine could not be checked.") : nil))
+            .font(.caption)
         } else {
           Text(copySummary).font(.callout).foregroundStyle(.secondary)
         }

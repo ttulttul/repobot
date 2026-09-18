@@ -177,8 +177,10 @@ struct RepositoryMapMachine {
 /// Exists only while the map window is open. Views observe rows, progress and list membership
 /// independently; no map view observes AppState.world or calls WorldSnapshot.repositories.
 @MainActor @Observable final class RepositoryMapModel {
+  var focusSearch = false
   var search = "" { didSet { if search != oldValue { filter() } } }
   var sharedOnly = false { didSet { if sharedOnly != oldValue { filter() } } }
+  private(set) var notificationCloneIDs: Set<String>?
   var selectedGroupID: String?
   var selectedGroup: RepositoryMapGroup? { visibleGroups.first { $0.id == selectedGroupID } }
   let progress = RepositoryMapProgress()
@@ -262,10 +264,20 @@ struct RepositoryMapMachine {
     revision = world.analysisRevision; initialized = true
     snapshotSource = stamp?.source; snapshotRevision = stamp?.revision
   }
+  func show(cloneIDs: Set<String>) {
+    search = ""
+    sharedOnly = false
+    notificationCloneIDs = cloneIDs
+    filter()
+  }
+  func clearNotificationFilter() { notificationCloneIDs = nil; filter() }
   private func filter() {
     filteringCount += 1
     let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-    let next = ordered.filter { (!sharedOnly || $0.machineCount > 1) && $0.matches(query) }
+    let next = ordered.filter { group in
+      (!sharedOnly || group.machineCount > 1) && group.matches(query)
+        && (notificationCloneIDs.map { ids in group.rows.contains { ids.contains($0.id) } } ?? true)
+    }
     if next.map(\.id) != visibleGroups.map(\.id) { visibleGroups = next }
     if !next.contains(where: { $0.id == selectedGroupID }) { selectedGroupID = next.first?.id }
   }

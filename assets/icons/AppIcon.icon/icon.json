@@ -1,0 +1,46 @@
+{
+  "fill": {
+    "automatic-gradient": "srgb:0.00000,0.38000,0.74000,1.00000"
+  },
+  "groups": [
+    {
+      "name": "Repositories",
+      "layers": [
+        {
+          "image-name": "Repositories.svg",
+          "name": "Repository lines"
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.25
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.35
+      }
+    },
+    {
+      "name": "Branch",
+      "layers": [
+        {
+          "image-name": "Branch.svg",
+          "name": "Branching arrow"
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.35
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}

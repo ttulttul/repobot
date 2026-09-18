@@ -8,6 +8,9 @@ import UserNotifications
   var body: some Scene {
     Settings { SettingsView(state: delegate.state) }
       .commands {
+        CommandGroup(after: .textEditing) {
+          Button("Find Repository…") { delegate.state.findRepository() }.keyboardShortcut("f")
+        }
         CommandGroup(after: .appSettings) {
           Button("Repository Map…") { delegate.state.showRepositoryMap() }
             .keyboardShortcut("m", modifiers: [.command, .shift])
@@ -19,10 +22,11 @@ import UserNotifications
 }
 @MainActor final class MenuAction: NSMenuItem {
   let handler: () -> Void
-  init(_ title: String, key: String = "", handler: @escaping () -> Void) {
+  init(_ title: String, key: String = "", enabled: Bool = true, handler: @escaping () -> Void) {
     self.handler = handler
     super.init(title: title, action: #selector(invoke), keyEquivalent: key)
     target = self
+    isEnabled = enabled
   }
   required init(coder: NSCoder) { fatalError("Not used") }
   @objc func invoke() { handler() }
@@ -48,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     NSApp.setActivationPolicy(.accessory)
     statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
+    menu.autoenablesItems = false
     menu.delegate = self
     statusItem.menu = menu
     state.menuChanged = { [weak self] in self?.updateBadge() }
@@ -55,15 +60,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     state.start()
     updateBadge()
     if CommandLine.arguments.contains("--repository-map") { state.showRepositoryMap() }
-    if CommandLine.arguments.contains("--settings")
-      || (state.configuration.environments.count == 1 && state.world.clones.isEmpty)
-    {
-      state.showSettings()
+    Task { @MainActor in
+      // Wait for SwiftUI to install its standard Settings command.
+      await Task.yield()
+      if state.needsSetup { state.showSetup() }
+      else if CommandLine.arguments.contains("--settings") { state.showSettings() }
     }
+  }
+  func applicationDidBecomeActive(_ notification: Notification) {
+    Task { await state.refreshNotificationAuthorization() }
   }
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool
   {
-    if !flag { state.showSettings() }
+    if !flag { if state.needsSetup { state.showSetup() } else { state.showSettings() } }
     return true
   }
   func updateBadge() {
@@ -110,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         action: nil, keyEquivalent: "")
       item.image = icon(severity, unavailable: environment.error != nil)
       let submenu = NSMenu()
+      submenu.autoenablesItems = false
       item.submenu = submenu
       header(
         environment.error
@@ -119,10 +129,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
       submenu.addItem(
         MenuAction("Open Terminal") { [state] in state.openTerminal(environment.environment) })
       submenu.addItem(.separator())
+      var included = Set<String>()
       for clone in clones.filter({ $0.status.severity >= .attention }).sorted(by: {
         $0.status.severity > $1.status.severity
-      }) { submenu.addItem(repoItem(clone)) }
-      var included = Set<String>()
+      }) { submenu.addItem(repoItem(clone)); included.insert(clone.id) }
       for root in environment.environment.roots {
         header(root, to: submenu)
         let expanded =
@@ -143,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
       if clones.isEmpty { header("No repositories found in configured roots", to: submenu) }
       submenu.addItem(.separator())
       submenu.addItem(
-        MenuAction("Rescan for repositories") { [state] in state.check(environment.id, rescan: true)
+        MenuAction("Rescan for Repositories", enabled: !state.checking) { [state] in state.check(environment.id, rescan: true)
         })
       submenu.addItem(
         MenuAction("Edit Environment…") { [state] in state.edit(environment.environment) })
@@ -152,11 +162,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     menu.addItem(.separator())
     menu.addItem(MenuAction("Repository Map…") { [state] in state.showRepositoryMap() })
     menu.addItem(MenuAction("Add Environment…") { [state] in state.showAdd() })
-    menu.addItem(MenuAction("Check Now", key: "r") { [state] in state.check() })
+    menu.addItem(MenuAction(state.checking ? "Checking…" : "Check Now", key: "r", enabled: !state.checking) { [state] in state.check() })
     menu.addItem(MenuAction("Coding Agents…") { [state] in state.showAgentSettings() })
     menu.addItem(MenuAction("Settings…", key: ",") { [state] in state.showSettings() })
     menu.addItem(.separator())
-    menu.addItem(MenuAction("Quit", key: "q") { NSApp.terminate(nil) })
+    menu.addItem(MenuAction("Quit Repobot", key: "q") { NSApp.terminate(nil) })
   }
   func header(_ text: String, to menu: NSMenu) {
     let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
@@ -181,8 +191,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         state.showDetail(clone)
       }
     }
-    item.image = icon(clone.status.severity)
-    item.toolTip = clone.repo.path
+    item.image = icon(clone.status.severity, unavailable: !state.freshness(for: clone).isCurrent)
+    item.toolTip = clone.repo.path + "\nOption-click to copy the path"
     return item
   }
   func icon(_ severity: Severity, unavailable: Bool = false) -> NSImage? {
@@ -210,9 +220,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
     withCompletionHandler completionHandler: @escaping () -> Void
   ) {
-    let id = response.notification.request.content.userInfo["cloneID"] as? String
+    // Copy only the supported, Sendable payload across the actor boundary.
+    let ids = response.notification.request.content.userInfo["cloneIDs"] as? [String]
+    let legacyID = response.notification.request.content.userInfo["cloneID"] as? String
     Task { @MainActor in
-      if let clone = state.world.clones.first(where: { $0.id == id }) { state.showDetail(clone) }
+      if let ids { state.showNotification(["cloneIDs": ids]) }
+      else if let legacyID { state.showNotification(["cloneID": legacyID]) }
+      else { state.showRepositoryMap() }
     }
     completionHandler()
   }

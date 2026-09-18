@@ -7,17 +7,21 @@ import SwiftUI
 import UserNotifications
 
 @MainActor @Observable final class AppState {
-  var configuration: Configuration
+  private(set) var configuration: Configuration
   var world: WorldSnapshot
   var attentionCount = 0
   @ObservationIgnored private var attentionTracker = AttentionTracker()
   var error: String?
   var checking = false
+  @ObservationIgnored private var checkTask: Task<Void, Never>?
   var settingsTab: SettingsTab = .general
   var environmentSheet: EnvironmentSheet?
-  var agents = AgentSettingsStore()
+  var agents: AgentSettingsStore
+  var notificationAuthorization: UNAuthorizationStatus?
+  private(set) var needsSetup = false
+  @ObservationIgnored private var started = false
   var logs: [String] = []
-  @ObservationIgnored let persistence = Persistence()
+  @ObservationIgnored let persistence: Persistence
   @ObservationIgnored var store: StateStore
   @ObservationIgnored var monitors: [UUID: EnvironmentMonitor] = [:]
   @ObservationIgnored var streamTask: Task<Void, Never>?
@@ -32,31 +36,39 @@ import UserNotifications
   @ObservationIgnored private var pendingNetwork = false
   @ObservationIgnored var wakeObserver: NSObjectProtocol?
   @ObservationIgnored var menuChanged: (() -> Void)?
-  init() {
+  init(persistence: Persistence = Persistence()) {
+    self.persistence = persistence
+    settingsTab = SettingsTab(rawValue: UserDefaults.standard.string(forKey: "selectedSettingsPane") ?? "") ?? .general
+    agents = AgentSettingsStore(persistence: persistence)
     var config = Configuration()
     var cached = WorldSnapshot()
     var failure: String?
     do {
-      if let saved = try Persistence().load(Configuration.self, from: "config.json") {
+      if let saved = try persistence.load(Configuration.self, from: "config.json") {
         config = saved
       } else {
-        try Persistence().save(config, to: "config.json")
+        config.environments[0].roots = []
+        needsSetup = true
+        try persistence.save(config, to: "config.json")
       }
-      cached = try Persistence().loadWorld(configuration: config) ?? cached
+      cached = try persistence.loadWorld(configuration: config) ?? cached
     } catch {
       failure =
         "Could not load saved data: \(error.localizedDescription). Monitoring is paused. Review settings before saving."
       config.enabled = false
     }
+    needsSetup = config.environments.allSatisfy { $0.roots.isEmpty }
     config.validate()
     configuration = config
     world = cached
     _ = attentionTracker.update(cached)
     attentionCount = attentionTracker.count
     error = failure
-    store = StateStore(configuration: config, cached: cached)
+    store = StateStore(configuration: config, persistence: persistence, cached: cached)
   }
   func start() {
+    started = true
+    Task { await refreshNotificationAuthorization() }
     streamTask = Task { [weak self, store] in
       for await value in await store.stream() {
         guard let self else { return }
@@ -87,11 +99,15 @@ import UserNotifications
     pathMonitor.start(queue: DispatchQueue(label: "Repobot.Network"))
   }
   func apply() {
+    guard started else { return }
     configuration.validate()
     let config = configuration
+    let previousCheck = checkTask
+    previousCheck?.cancel()
     let previous = reconfigureTask
     reconfigureTask = Task { [weak self] in
       await previous?.value
+      await previousCheck?.value
       guard let self else { return }
       let old = monitors
       monitors = [:]
@@ -102,7 +118,7 @@ import UserNotifications
         menuChanged?()
         return
       }
-      for env in config.environments {
+      for env in config.environments where !env.roots.isEmpty {
         let monitor = EnvironmentMonitor(environment: env, configuration: config, store: store)
         monitors[env.id] = monitor
         await monitor.start()
@@ -110,29 +126,56 @@ import UserNotifications
       menuChanged?()
     }
   }
-  func save() {
+  /// Persist the proposed value before publishing it or changing monitoring.
+  @discardableResult func save(_ proposed: Configuration) -> Bool {
+    var next = proposed
+    next.validate()
     do {
-      try persistence.save(configuration, to: "config.json")
+      try persistence.save(next, to: "config.json")
+      configuration = next
+      needsSetup = next.environments.allSatisfy { $0.roots.isEmpty }
       error = nil
       apply()
-    } catch { self.error = "Could not save settings: \(error.localizedDescription)" }
+      menuChanged?()
+      return true
+    } catch {
+      self.error = "Could not save settings: \(error.localizedDescription)"
+      return false
+    }
   }
-  func toggle() {
-    configuration.enabled.toggle()
-    save()
+  @discardableResult func changeConfiguration(_ change: (inout Configuration) -> Void) -> Bool {
+    var next = configuration
+    change(&next)
+    return save(next)
   }
+  func toggle() { changeConfiguration { $0.enabled.toggle() } }
   func check(_ id: UUID? = nil, rescan: Bool = false) {
-    guard configuration.enabled else { return }
+    guard !checking else { return }
+    guard configuration.environments.contains(where: { (id == nil || $0.id == id) && !$0.roots.isEmpty }) else {
+      showSetup(); return
+    }
     checking = true
     menuChanged?()
-    Task {
-      await withTaskGroup(of: Void.self) { group in
-        for (key, monitor) in monitors where id == nil || key == id {
-          group.addTask { await monitor.checkNow(rescan: rescan) }
+    let reconfiguration = reconfigureTask
+    checkTask = Task {
+      defer { checking = false; checkTask = nil; menuChanged?() }
+      await reconfiguration?.value
+      guard !Task.isCancelled else { return }
+      if configuration.enabled {
+        let targets = monitors.filter { id == nil || $0.key == id }.map(\.value)
+        await withTaskGroup(of: Void.self) { group in
+          for monitor in targets { group.addTask { await monitor.checkNow(rescan: rescan) } }
+        }
+      } else {
+        let config = configuration
+        let targets = config.environments.filter { (id == nil || $0.id == id) && !$0.roots.isEmpty }
+        await withTaskGroup(of: Void.self) { group in
+          for environment in targets {
+            let monitor = EnvironmentMonitor(environment: environment, configuration: config, store: store)
+            group.addTask { await monitor.checkOnce(rescan: rescan) }
+          }
         }
       }
-      checking = false
-      menuChanged?()
     }
   }
   private func networkChanged(_ state: NetworkCheckPolicy.State) {
@@ -172,6 +215,8 @@ import UserNotifications
     configuration.enabled = false
     reconfigureTask?.cancel()
     await reconfigureTask?.value
+    checkTask?.cancel()
+    await checkTask?.value
     streamTask?.cancel()
     pathMonitor.cancel()
     reconnectTask?.cancel()
@@ -179,23 +224,29 @@ import UserNotifications
     for monitor in monitors.values { await monitor.stop() }
     if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
   }
-  func add(_ environment: RepobotCore.Environment) {
-    configuration.environments.append(environment)
-    save()
-  }
-  func update(_ environment: RepobotCore.Environment) {
-    if let index = configuration.environments.firstIndex(where: { $0.id == environment.id }) {
-      configuration.environments[index] = environment
-      save()
+  @discardableResult func add(_ environment: RepobotCore.Environment) -> Bool {
+    changeConfiguration { config in
+      if let index = config.environments.firstIndex(where: { $0.id == environment.id }) {
+        config.environments[index] = environment
+      } else { config.environments.append(environment) }
     }
   }
+  @discardableResult func update(_ environment: RepobotCore.Environment) -> Bool { add(environment) }
+  @discardableResult func removeEnvironment(_ id: UUID) -> Bool {
+    changeConfiguration { $0.environments.removeAll { $0.id == id && $0.kind == .ssh } }
+  }
   func snooze(_ clone: Clone, until: Date) {
-    configuration.snoozed[clone.id] = until
-    save()
+    changeConfiguration { $0.snoozed[clone.id] = until }
+  }
+  func resumeWarnings(_ clone: Clone) {
+    changeConfiguration { $0.ignored.remove(clone.id); $0.snoozed[clone.id] = nil }
   }
   func ignore(_ clone: Clone) {
-    configuration.ignored.insert(clone.id)
-    save()
+    changeConfiguration { $0.ignored.insert(clone.id) }
+  }
+  func freshness(for clone: Clone) -> RepositoryFreshness {
+    RepositoryFreshness(paused: !configuration.enabled, pending: clone.repo.awaitingFreshCheck == true,
+      error: clone.repo.error ?? world.environments.first { $0.id == clone.environmentID }?.error)
   }
   func log(_ text: String) {
     logs.append("\(Date().formatted(date:.omitted,time:.standard)) \(text)")
@@ -217,12 +268,15 @@ import UserNotifications
     window.title = title
     window.contentViewController = NSHostingController(rootView: content())
     window.isReleasedWhenClosed = false
-    window.center()
+    if !window.setFrameUsingName(key) { window.center() }
+    window.setFrameAutosaveName(key)
     windows[key] = window
     window.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
   func headline(for clone: Clone) -> String {
+    let freshness = freshness(for: clone)
+    if let summary = freshness.summary { return summary }
     if configuration.ignored.contains(clone.id) {
       return "Ignored — monitoring continues without warnings"
     }
@@ -246,6 +300,10 @@ import UserNotifications
     settingsTab = .agents
     showSettings()
   }
+  func findRepository() {
+    showRepositoryMap()
+    repositoryMapModel?.focusSearch = true
+  }
   func showRepositoryMap() {
     let key = "repository-map"
     if let window = windows[key] {
@@ -267,9 +325,27 @@ import UserNotifications
     }
   }
   func showSettings() {
-    show("settings", title: "Repobot Settings", width: 780, height: 560) {
-      SettingsView(state: self)
+    // Invoke the Settings scene's own command, including its original target.
+    // This keeps AppKit entry points and Command-Comma on the same SwiftUI window.
+    NSApp.activate(ignoringOtherApps: true)
+    if let item = Self.settingsCommand(in: NSApp.mainMenu), let action = item.action {
+      if !NSApp.sendAction(action, to: item.target, from: item) {
+        error = "Settings could not be opened. Try Repobot’s Settings command (⌘,)."
+      }
+    } else {
+      error = "Settings could not be opened. Use Repobot’s Settings command (⌘,)."
     }
+  }
+  static func settingsCommand(in menu: NSMenu?) -> NSMenuItem? {
+    for item in menu?.items ?? [] {
+      if item.keyEquivalent == ",", item.keyEquivalentModifierMask == .command, item.action != nil { return item }
+      if let nested = settingsCommand(in: item.submenu) { return nested }
+    }
+    return nil
+  }
+  func showSetup() {
+    settingsTab = .environments
+    showSettings()
   }
   func showAdd() {
     settingsTab = .environments
@@ -306,16 +382,41 @@ import UserNotifications
     if let error { self.error = "Terminal could not be opened: \(error)"; return false }
     return true
   }
+  var notificationSummary: String {
+    guard configuration.notifications else { return "Off" }
+    switch notificationAuthorization {
+    case .denied: return "Blocked in System Settings"
+    case .notDetermined: return "Permission needed"
+    case .authorized, .provisional, .ephemeral: return "Enabled"
+    default: return "Checking permission…"
+    }
+  }
+  func refreshNotificationAuthorization() async {
+    notificationAuthorization = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+  }
   func requestNotifications() {
     Task {
       do {
-        let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [
-          .alert, .sound,
-        ])
-        configuration.notifications = granted
-        save()
-      } catch { self.error = error.localizedDescription }
+        _ = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+        await refreshNotificationAuthorization()
+      } catch { self.error = "Could not request notification permission: \(error.localizedDescription)" }
     }
+  }
+  func openNotificationSettings() {
+    let id = Bundle.main.bundleIdentifier ?? "com.repobot.app"
+    let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=" + id)!
+    if !NSWorkspace.shared.open(url) {
+      error = "Open System Settings → Notifications → Repobot to change notification permissions."
+    }
+  }
+  func showNotification(_ userInfo: [AnyHashable: Any]) {
+    if let ids = userInfo["cloneIDs"] as? [String], ids.count > 1 {
+      showRepositoryMap()
+      repositoryMapModel?.show(cloneIDs: Set(ids))
+    } else if let id = (userInfo["cloneIDs"] as? [String])?.first ?? userInfo["cloneID"] as? String,
+              let clone = world.clones.first(where: { $0.id == id }) {
+      showDetail(clone)
+    } else { showRepositoryMap() }
   }
   func notify(_ increased: [Clone], in new: WorldSnapshot) {
     for (id, clones) in NotificationTransitions.eligible(
@@ -324,12 +425,18 @@ import UserNotifications
       let content = UNMutableNotificationContent()
       content.title =
         "\(new.environments.first {$0.id==id}?.environment.name ?? "Environment"): \(clones.count) repos need attention"
-      content.body = clones.prefix(3).compactMap { $0.status.findings.first?.text }.joined(
+      content.body = clones.prefix(3).map { clone in
+        "\((clone.repo.path as NSString).lastPathComponent): \(clone.status.findings.first?.text ?? "Needs attention")"
+      }.joined(
         separator: "\n")
-      content.userInfo = ["cloneID": clones[0].id]
+      if clones.count > 3 { content.body += "\nAnd \(clones.count - 3) more repositories" }
+      content.userInfo = ["cloneIDs": clones.map(\.id)]
       let request = UNNotificationRequest(
         identifier: "repobot-\(id)", content: content, trigger: nil)
-      Task { try? await UNUserNotificationCenter.current().add(request) }
+      Task {
+        do { try await UNUserNotificationCenter.current().add(request) }
+        catch { self.error = "Could not deliver notification: \(error.localizedDescription)" }
+      }
     }
   }
 }
