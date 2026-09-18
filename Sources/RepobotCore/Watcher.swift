@@ -1,4 +1,5 @@
 import CoreServices
+import CryptoKit
 import Foundation
 
 public enum WatchEvent: Sendable {
@@ -106,7 +107,8 @@ public final class RemoteWatcher: @unchecked Sendable {
   private let task: Task<Void, Never>
   public init(
     transport: any Transport, roots: [String], repos: [String], capabilities: Capabilities,
-    gitDirectories: [String: [String]] = [:], handler: @escaping @Sendable (WatchEvent) -> Void
+    gitDirectories: [String: [String]] = [:], clientID: String? = nil,
+    handler: @escaping @Sendable (WatchEvent) -> Void
   ) throws {
     let script: String
     let program: String
@@ -115,15 +117,21 @@ public final class RemoteWatcher: @unchecked Sendable {
       program = "python3"
       args = ["-"] + roots + ["--"] + repos
       let inventory = try JSONEncoder().encode(gitDirectories).base64EncodedString()
+      // A new connection from the same client replaces a watcher stranded by a dead one.
+      let client = (clientID ?? "").filter { $0.isHexDigit }
       script = "import json, base64\nknown_git_directories = json.loads(base64.b64decode('" + inventory + "'))\n"
+        + "client_id = '" + client + "'\n"
         + (try Scripts.load("watcher.py"))
     } else {
       program = "sh"
       args = ["-s", "--"] + roots + repos + gitDirectories.values.flatMap { $0 }
+      // Recursive tools spend one inotify watch per directory; keep them out of
+      // dependency trees and Git object stores.
+      let skipped = "/(node_modules|\\.venv|vendor|target|build|dist|\\.git/(objects|logs|lfs|modules))(/|$)"
       let command =
         capabilities.inotifywait
-        ? "inotifywait -q -m -r -e modify,attrib,move,create,delete -- \"$@\""
-        : "fswatch -r -- \"$@\""
+        ? "inotifywait -q -m -r --exclude '\(skipped)' -e modify,attrib,move,create,delete -- \"$@\""
+        : "fswatch -r -E -e '\(skipped)' -- \"$@\""
       script = """
         original=$#
         for path do
@@ -131,7 +139,9 @@ public final class RemoteWatcher: @unchecked Sendable {
             set -- "$@" "$path"
         done
         shift "$original"
-        (while sleep 30; do printf 'PING\\000'; done) &
+        # A quiet watcher never writes, so it would outlive a closed connection.
+        # The heartbeat notices the failed write and ends the whole process group.
+        (trap '' PIPE; while sleep 30; do printf 'PING\\000' 2>/dev/null || kill 0; done) &
         ping=$!
         trap 'kill "$ping" 2>/dev/null' EXIT HUP INT TERM
         printf 'READY\\000'
@@ -158,6 +168,16 @@ public final class RemoteWatcher: @unchecked Sendable {
     }
   }
   public func stop() { batcher.stop(); task.cancel() }
+  /// Identifies this Mac, this installed binary and one environment. Another Mac, or a
+  /// development build beside the installed app, must not evict a watcher it does not own.
+  public static func clientID(environment: UUID) -> String {
+    var host = uuid_t(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    var wait = timespec(tv_sec: 1, tv_nsec: 0)
+    _ = gethostuuid(&host, &wait)
+    let identity = [UUID(uuid: host).uuidString, Bundle.main.executablePath ?? "", environment.uuidString]
+    return SHA256.hash(data: Data(identity.joined(separator: "\n").utf8)).prefix(16)
+      .map { String(format: "%02x", $0) }.joined()
+  }
   deinit { stop() }
 }
 

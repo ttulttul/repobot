@@ -362,7 +362,8 @@ public actor EnvironmentMonitor {
       } else if capabilities.python || capabilities.inotifywait || capabilities.fswatch {
         remoteWatcher = try RemoteWatcher(
           transport: transport, roots: environment.roots, repos: snapshot.repos.map(\.path),
-          capabilities: capabilities, gitDirectories: coverage.gitDirectories, handler: handler)
+          capabilities: capabilities, gitDirectories: coverage.gitDirectories,
+          clientID: RemoteWatcher.clientID(environment: environment.id), handler: handler)
         snapshot.mode =
           "Events — \(capabilities.python ? (capabilities.os == "Linux" ? "inotify via python3" : "FSEvents via python3") : capabilities.inotifywait ? "inotifywait" : "fswatch")"
         lastHeartbeat = Date()

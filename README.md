@@ -242,8 +242,9 @@ until one clone can compare both tips. Read-only `ls-remote` detects server chan
 but cannot update ahead/behind counts; those remain relative to the last fetch.
 
 A status command has a ten-second watchdog. Slow repositories are retried on safety
-sweeps and manual checks. Inotify watches have directory/kernel caps; safety sweeps
-cover unwatched paths. Existing native watcher tools may have their own limits.
+sweeps and manual checks. Inotify watches cover Git state and non-ignored working-tree
+directories only, within directory/kernel caps; safety sweeps cover unwatched paths.
+Remote watchers exit when their SSH connection closes and replace a stranded predecessor. Existing native watcher tools may have their own limits.
 LAN scanning is restricted to one active Ethernet/Wi-Fi interface and at most a
 /22; Bonjour and manual entry cover hosts outside that range.
 

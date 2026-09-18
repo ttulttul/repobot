@@ -251,11 +251,23 @@ accurate too). If the check fails (no credentials on that box, offline), the rep
 
 Details for the event tiers:
 
-- **What we watch.** `.git/` internals (HEAD, index, refs/, logs/HEAD, FETCH_HEAD, MERGE_HEAD…) for
-  every repo — that's ~5 watches per repo and catches commits, checkouts, fetches, rebases, stashes.
-  Plus the working tree recursively, skipping `.git`, `node_modules`, `.venv`, `target`, `build`,
-  capped at 2,000 directories per repo and the kernel's `max_user_watches`. Repos over the cap get
-  `.git`-only watching plus the safety sweep.
+- **What we watch.** inotify is not recursive: every directory costs one watch from a per-user
+  budget (`fs.inotify.max_user_watches`) shared with editors and other tools. For Git state we watch
+  only each gitdir itself (HEAD, index, packed-refs, FETCH_HEAD, MERGE_HEAD…) and its `refs/`
+  hierarchy — never `objects/` or `logs/` — a handful of watches per repo that catches commits,
+  checkouts, fetches, rebases, stashes. For the working tree we watch only directories that hold
+  tracked or untracked-but-not-ignored files (`git ls-files --cached --others --exclude-standard`),
+  so ignored dependency, virtualenv and model trees cost nothing. New directories are added unless
+  `git check-ignore` matches. Caps: 2,000 directories per repo and half of `max_user_watches`
+  overall. Repos over a cap keep Git-state watching plus the safety sweep. The
+  `inotifywait`/`fswatch` tier is recursive by nature and only excludes well-known dependency
+  directories and Git object stores.
+- **No orphans.** The script arrives on stdin, so stdin EOF carries no signal. Instead the watcher
+  exits as soon as the read end of its stdout closes (poll/kqueue hangup) or any write fails, so
+  killing the local `ssh` never strands a remote process. A connection that dies without the remote
+  noticing (sleep, network change) is covered by replacement: each watcher holds a Linux abstract
+  socket named after the client (this Mac + binary + environment); a new watcher from the same
+  client asks the old one to exit. Nothing is written on the remote.
 - **Safety sweep.** Even in event mode a full probe runs every 5 min (configurable) to catch anything
   the watcher missed and to run the upstream check.
 - **Debounce.** Events are coalesced per repo for 2 s (an editor save or `git commit` produces dozens

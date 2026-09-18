@@ -535,6 +535,16 @@ struct CoreTests {
     #expect(after[0].modified == 1)
     await #expect(throws: (any Error).self) { try await AgentInspection.ensureUnchanged(agentContext) }
     watcher.stop()
+    // Killing the local ssh must not strand the remote watcher and its inotify watches.
+    var orphans = "unknown"
+    for _ in 0..<50 {
+      orphans = try await transport.run(
+        script: "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null | grep -q '^python3 - ' && echo $p; done; true",
+        arguments: [], timeout: 10).text
+      if orphans.isEmpty { break }
+      try await Task.sleep(for: .milliseconds(100))
+    }
+    #expect(orphans.isEmpty)
     await transport.close()
     let trusted = try Data(contentsOf: root.appendingPathComponent("known_hosts"))
     _ = try await ProcessRunner.run(
