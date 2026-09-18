@@ -41,7 +41,7 @@ public enum Probe {
   }
   public static func repos(
     _ paths: [String], peers: [String] = [], peerMap: [String: [String]]? = nil,
-    upstream: UpstreamCheck = .off, using transport: any Transport
+    upstream: UpstreamCheck = .off, previous: [String: RepoSnapshot] = [:], using transport: any Transport
   ) async throws -> [RepoSnapshot] {
     guard !paths.isEmpty else { return [] }
     if upstream != .off {
@@ -51,7 +51,10 @@ public enum Probe {
     let result = try await transport.run(
       script: Scripts.load("probe.sh"),
       arguments: [upstream.rawValue]
-        + paths.flatMap { [$0, (peerMap?[$0] ?? peers).joined(separator: " ")] },
+        + paths.flatMap { path in
+          let fingerprint = previous[path].flatMap { $0.error == nil ? $0.probeFingerprint : nil }
+          return [path, (fingerprint.map { "cache:\($0) " } ?? "") + (peerMap?[path] ?? peers).sorted().joined(separator: " ")]
+        },
       timeout: max(30, Double(paths.count) * 24))
     guard result.status == 0 else {
       throw RepobotError.message(
@@ -61,7 +64,40 @@ public enum Probe {
     guard repos.count == paths.count else {
       throw RepobotError.message("Incomplete probe response")
     }
-    return repos
+    return try repos.map { fresh in
+      guard fresh.reusedProbeFacts == true else { return fresh }
+      guard let old = previous[fresh.path], old.error == nil,
+            old.probeFingerprint == fresh.probeFingerprint else {
+        throw RepobotError.message("Probe reused facts without a matching baseline")
+      }
+      var repo = fresh
+      repo.reusedProbeFacts = nil
+      repo.stashCount = old.stashCount; repo.originURL = old.originURL; repo.rootCommit = old.rootCommit
+      repo.shallow = old.shallow; repo.lastCommitDate = old.lastCommitDate; repo.lastCommitSubject = old.lastCommitSubject
+      repo.localBranches = old.localBranches; repo.branchCommitDates = old.branchCommitDates
+      repo.branchWork = old.branchWork; repo.localCommitSHAs = old.localCommitSHAs
+      repo.ancestry = old.ancestry; repo.detachedCommits = old.detachedCommits
+      return repo
+    }
+  }
+  /// Keep copies of an upstream in one invocation so read-only queries can share evidence.
+  /// Grouping uses redacted URLs only as a batching hint; the host verifies the actual
+  /// effective Git configuration and URL before sharing any result.
+  static func upstreamBatches(_ repos: [RepoSnapshot], size: Int) -> [[String]] {
+    var keys: [String] = [], groups: [String: [String]] = [:]
+    for repo in repos {
+      let key = repo.trackingRemoteURL ?? repo.path
+      if groups[key] == nil { keys.append(key) }
+      groups[key, default: []].append(repo.path)
+    }
+    var batches: [[String]] = [], batch: [String] = []
+    for key in keys {
+      let group = groups[key]!
+      if !batch.isEmpty && batch.count + group.count > size { batches.append(batch); batch = [] }
+      batch += group
+    }
+    if !batch.isEmpty { batches.append(batch) }
+    return batches
   }
   /// Refresh only server evidence. Local status remains valid until a watcher or sweep refreshes it.
   public static func checkUpstreams(
@@ -69,9 +105,12 @@ public enum Probe {
     method: UpstreamCheck, using transport: any Transport
   ) async throws -> [RepoSnapshot] {
     guard method != .off, !local.isEmpty else { return local }
+    let counts = Dictionary(grouping: local, by: { $0.trackingRemoteURL ?? $0.path }).mapValues(\.count)
     let result = try await transport.run(
       script: Scripts.load("upstream.sh"),
-      arguments: [method.rawValue] + local.flatMap { [$0.path, ""] },
+      arguments: [method.rawValue] + local.flatMap {
+        [$0.path, counts[$0.trackingRemoteURL ?? $0.path, default: 0] > 1 ? "share" : ""]
+      },
       timeout: max(30, Double(local.count) * 24))
     guard result.status == 0 else {
       throw RepobotError.message(result.errorText.isEmpty
@@ -152,6 +191,9 @@ public enum Probe {
       }
       guard var r = repo else { throw RepobotError.message("Probe field outside repository") }
       switch key {
+      case "FINGERPRINT":
+        let value = try take(1)[0]; r.probeFingerprint = value.isEmpty ? nil : value
+      case "REUSED": r.reusedProbeFacts = true
       case "HEAD":
         let v = try take(3)
         r.headSHA = v[0] == "(initial)" ? "" : v[0]

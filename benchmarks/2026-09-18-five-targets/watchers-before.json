@@ -1,0 +1,77 @@
+{
+  "label": "before-watchers",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "workload_version": 1,
+  "source_sha256": "29bc8e7010dccfd6f0f824279dd5d470ee774a7fb40d8e701933acfb7d6e5b60",
+  "runs": [
+    {
+      "workload": "watcher_git_directories",
+      "repetition": 0,
+      "cpu_ms_per_op": 92.12339999999999,
+      "wall_ms_per_op": 99.26509999204427,
+      "git_invocations": 120
+    },
+    {
+      "workload": "remote_event_routing",
+      "repetition": 0,
+      "cpu_ms_per_op": 0.062476099999999986,
+      "wall_ms_per_op": 0.06256461250595749
+    },
+    {
+      "workload": "watcher_git_directories",
+      "repetition": 1,
+      "cpu_ms_per_op": 106.32580000000003,
+      "wall_ms_per_op": 115.37022499833256,
+      "git_invocations": 120
+    },
+    {
+      "workload": "remote_event_routing",
+      "repetition": 1,
+      "cpu_ms_per_op": 0.06284980000000001,
+      "wall_ms_per_op": 0.06291476250626146
+    },
+    {
+      "workload": "watcher_git_directories",
+      "repetition": 2,
+      "cpu_ms_per_op": 96.21939999999992,
+      "wall_ms_per_op": 103.26407498214394,
+      "git_invocations": 120
+    },
+    {
+      "workload": "remote_event_routing",
+      "repetition": 2,
+      "cpu_ms_per_op": 0.06467989999999996,
+      "wall_ms_per_op": 0.06530030419817194
+    },
+    {
+      "workload": "watcher_git_directories",
+      "repetition": 3,
+      "cpu_ms_per_op": 102.76900000000008,
+      "wall_ms_per_op": 109.87838341388851,
+      "git_invocations": 120
+    },
+    {
+      "workload": "remote_event_routing",
+      "repetition": 3,
+      "cpu_ms_per_op": 0.0626601,
+      "wall_ms_per_op": 0.06269178329966962
+    },
+    {
+      "workload": "watcher_git_directories",
+      "repetition": 4,
+      "cpu_ms_per_op": 94.83299999999986,
+      "wall_ms_per_op": 101.63839999586344,
+      "git_invocations": 120
+    },
+    {
+      "workload": "remote_event_routing",
+      "repetition": 4,
+      "cpu_ms_per_op": 0.06297129999999998,
+      "wall_ms_per_op": 0.06300816250732169
+    }
+  ],
+  "median_cpu_ms": {
+    "remote_event_routing": 0.06284980000000001,
+    "watcher_git_directories": 96.21939999999992
+  }
+}

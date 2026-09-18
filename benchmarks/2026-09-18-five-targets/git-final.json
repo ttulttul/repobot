@@ -1,0 +1,166 @@
+{
+  "metadata": {
+    "label": "final-git",
+    "utc": "2026-09-18T17:01:58.222502+00:00",
+    "git_head": "8bdc2f2ed96a2ed896cb1e50d1234ec051b39717",
+    "source_sha256": "2ebcead5897bbf5dfcf201d201b03f1d1fa43099f08cd664b25b334bc571745f",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "cpu": "Apple M2 Max",
+    "workload_version": 100,
+    "copies": 12,
+    "repeats": 3,
+    "measurement": "getrusage user+system CPU; Git suite includes RUSAGE_CHILDREN; wall clock; setup excluded",
+    "source_archive": "git-final.sources.tar.gz",
+    "compiler_version": "Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)\nTarget: arm64-apple-macosx26.0",
+    "binaries_sha256": {
+      "RepobotPackageTests": "90734b21fd581f26ab55d53eb20fe8e6f30c38e2590505c2acabaa4b684c7b0b"
+    },
+    "command": [
+      "./scripts/swift.sh",
+      "test",
+      "-c",
+      "release",
+      "--skip-build",
+      "--filter",
+      "ProbePerformanceTests"
+    ]
+  },
+  "runs": [
+    [
+      {
+        "app_cpu_ms_per_op": 1.1007999999999998,
+        "child_cpu_ms_per_op": 982.805,
+        "counters": {
+          "git_invocations": 665,
+          "ls_remote": 5
+        },
+        "cpu_ms_per_op": 983.9057999999999,
+        "operations": 5,
+        "wall_ms_per_op": 1102.6626110076904,
+        "workload": "upstream_shared"
+      },
+      {
+        "app_cpu_ms_per_op": 1.3148000000000006,
+        "child_cpu_ms_per_op": 1170.7732,
+        "counters": {
+          "git_invocations": 660,
+          "ls_remote": 0
+        },
+        "cpu_ms_per_op": 1172.088,
+        "operations": 5,
+        "wall_ms_per_op": 1324.409008026123,
+        "workload": "git_unchanged"
+      }
+    ],
+    [
+      {
+        "app_cpu_ms_per_op": 1.2187999999999997,
+        "child_cpu_ms_per_op": 1040.4571999999998,
+        "counters": {
+          "git_invocations": 665,
+          "ls_remote": 5
+        },
+        "cpu_ms_per_op": 1041.676,
+        "operations": 5,
+        "wall_ms_per_op": 1177.356195449829,
+        "workload": "upstream_shared"
+      },
+      {
+        "app_cpu_ms_per_op": 1.5186000000000006,
+        "child_cpu_ms_per_op": 1282.3304,
+        "counters": {
+          "git_invocations": 660,
+          "ls_remote": 0
+        },
+        "cpu_ms_per_op": 1283.849,
+        "operations": 5,
+        "wall_ms_per_op": 1473.5956192016602,
+        "workload": "git_unchanged"
+      }
+    ],
+    [
+      {
+        "app_cpu_ms_per_op": 1.1192,
+        "child_cpu_ms_per_op": 993.5946000000001,
+        "counters": {
+          "git_invocations": 665,
+          "ls_remote": 5
+        },
+        "cpu_ms_per_op": 994.7138000000001,
+        "operations": 5,
+        "wall_ms_per_op": 1128.5226106643677,
+        "workload": "upstream_shared"
+      },
+      {
+        "app_cpu_ms_per_op": 1.379799999999999,
+        "child_cpu_ms_per_op": 1197.2931999999998,
+        "counters": {
+          "git_invocations": 660,
+          "ls_remote": 0
+        },
+        "cpu_ms_per_op": 1198.6729999999998,
+        "operations": 5,
+        "wall_ms_per_op": 1356.9905996322632,
+        "workload": "git_unchanged"
+      }
+    ]
+  ],
+  "summary": {
+    "upstream_shared": {
+      "cpu_ms_per_op": {
+        "median": 994.7138000000001,
+        "min": 983.9057999999999,
+        "max": 1041.676,
+        "mad": 10.80800000000022
+      },
+      "wall_ms_per_op": {
+        "median": 1128.5226106643677,
+        "min": 1102.6626110076904,
+        "max": 1177.356195449829,
+        "mad": 25.859999656677246
+      },
+      "counters": [
+        {
+          "git_invocations": 665,
+          "ls_remote": 5
+        },
+        {
+          "git_invocations": 665,
+          "ls_remote": 5
+        },
+        {
+          "git_invocations": 665,
+          "ls_remote": 5
+        }
+      ]
+    },
+    "git_unchanged": {
+      "cpu_ms_per_op": {
+        "median": 1198.6729999999998,
+        "min": 1172.088,
+        "max": 1283.849,
+        "mad": 26.58499999999981
+      },
+      "wall_ms_per_op": {
+        "median": 1356.9905996322632,
+        "min": 1324.409008026123,
+        "max": 1473.5956192016602,
+        "mad": 32.58159160614014
+      },
+      "counters": [
+        {
+          "git_invocations": 660,
+          "ls_remote": 0
+        },
+        {
+          "git_invocations": 660,
+          "ls_remote": 0
+        },
+        {
+          "git_invocations": 660,
+          "ls_remote": 0
+        }
+      ]
+    }
+  }
+}

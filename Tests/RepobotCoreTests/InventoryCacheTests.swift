@@ -149,6 +149,92 @@ struct InventoryCacheTests {
     try Data("not a database".utf8).write(to: file)
     #expect(throws: (any Error).self) { try persistence.loadWorld(configuration: Configuration()) }
   }
+  private func scalar(_ root: URL, _ query: String) throws -> String? {
+    var db: OpaquePointer?, statement: OpaquePointer?
+    guard sqlite3_open(root.appendingPathComponent("inventory.sqlite").path, &db) == SQLITE_OK else {
+      throw RepobotError.message("Test database did not open")
+    }
+    defer { sqlite3_finalize(statement); sqlite3_close(db) }
+    guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK else {
+      throw RepobotError.message(String(cString: sqlite3_errmsg(db)))
+    }
+    guard sqlite3_step(statement) == SQLITE_ROW, let value = sqlite3_column_text(statement, 0) else { return nil }
+    return String(cString: value)
+  }
+
+  @Test func testFreshnessUpdatesPreservePayloadPrecisionNullsAndRollback() throws {
+    let root = try CoreTests().temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cache = InventoryCache(directory: root)
+    var snapshot = fixture(1)
+    try cache.save([snapshot])
+    let originalPayload = try scalar(root, "SELECT hex(data) FROM repositories")
+    let original = snapshot
+    snapshot.repos[0].probedAt = Date(timeIntervalSinceReferenceDate: 812345678.123456)
+    snapshot.repos[0].upstreamCheckedAt = Date(timeIntervalSinceReferenceDate: 812345678.987654)
+    snapshot.environment.name = "Updated metadata"
+    try sql(root, "CREATE TRIGGER fail_freshness BEFORE UPDATE OF probed_at ON repositories BEGIN SELECT RAISE(ABORT, 'fixture'); END")
+    #expect(throws: (any Error).self) { try cache.save([snapshot]) }
+    #expect(cache.freshnessOnlyWrites == 0)
+    #expect(try cache.load()?.first?.repos == original.repos)
+    #expect(try cache.load()?.first?.environment.name == original.environment.name)
+    try sql(root, "DROP TRIGGER fail_freshness")
+    try cache.save([snapshot])
+    #expect(cache.encodedRepositories == 1)
+    #expect(cache.freshnessOnlyWrites == 1)
+    #expect(try scalar(root, "SELECT hex(data) FROM repositories") == originalPayload)
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+    snapshot.repos[0].upstreamCheckedAt = nil
+    try cache.save([snapshot])
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+    #expect(cache.encodedRepositories == 1)
+    snapshot.repos[0].upstreamError = "Unreachable"
+    snapshot.repos[0].upstreamUnknownSince = Date(timeIntervalSince1970: 2000)
+    try cache.save([snapshot])
+    #expect(cache.encodedRepositories == 2) // Semantic upstream evidence must still update the payload.
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+  }
+
+  @Test func testVersionOneMigrationIsAtomicAndPreservesInventory() throws {
+    let root = try CoreTests().temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    var snapshot = fixture(2)
+    snapshot.repos[0].upstreamCheckedAt = Date(timeIntervalSince1970: 999)
+    struct LegacyEnvironment: Encodable { var snapshot: EnvironmentSnapshot; var position: Int }
+    let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+    func blob<T: Encodable>(_ value: T) throws -> String {
+      "X'" + (try encoder.encode(value)).map { String(format: "%02x", $0) }.joined() + "'"
+    }
+    var metadata = snapshot; metadata.repos = []
+    let id = snapshot.id.uuidString
+    try sql(root, """
+      CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE environments (id TEXT PRIMARY KEY, data BLOB NOT NULL);
+      CREATE TABLE repositories (environment TEXT NOT NULL, path TEXT NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(environment, path));
+      INSERT INTO metadata VALUES ('complete','1');
+      INSERT INTO environments VALUES ('\(id)', \(try blob(LegacyEnvironment(snapshot: metadata, position: 0))));
+      PRAGMA user_version=1;
+      """)
+    for (position, repo) in snapshot.repos.enumerated() {
+      try sql(root, "INSERT INTO repositories VALUES ('\(id)', '\(repo.path.replacingOccurrences(of: "'", with: "''"))', \(position), \(try blob(repo)))")
+    }
+    let cache = InventoryCache(directory: root)
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+    try sql(root, "CREATE TRIGGER fail_migration BEFORE INSERT ON repositories BEGIN SELECT RAISE(ABORT, 'fixture'); END")
+    #expect(throws: (any Error).self) { try cache.save([snapshot]) }
+    #expect(try scalar(root, "PRAGMA user_version") == "1")
+    #expect(throws: (any Error).self) { try scalar(root, "SELECT probed_at FROM repositories") }
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+    try sql(root, "DROP TRIGGER fail_migration")
+    try cache.save([snapshot])
+    #expect(try scalar(root, "PRAGMA user_version") == "2")
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+    snapshot.repos[0].probedAt = Date(timeIntervalSince1970: 3000)
+    try cache.save([snapshot])
+    #expect(cache.encodedRepositories == 2)
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+  }
+
   @Test func testInterruptedWriterRecoversPreviousCommittedInventory() async throws {
     let root = try CoreTests().temporary()
     defer { try? FileManager.default.removeItem(at: root) }

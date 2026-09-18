@@ -601,7 +601,7 @@ private actor EventRecorder {
   func add(_ event: WatchEvent) {
     switch event {
     case .ready: ready = true
-    case .changed: changed = true
+    case .changed, .changedPaths: changed = true
     default: break
     }
   }

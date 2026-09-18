@@ -6,13 +6,10 @@ public actor EnvironmentMonitor {
   private let configuration: Configuration, store: StateStore
   private var transport: any Transport
   private var repoPositions: [String: Int] = [:]
-  private var repositoryWatchPaths: [String: [String]] = [:]
-  private func indexRepositories() {
+  private var repositoryWatchPaths = RepositoryWatchPaths()
+  private func indexRepositories(refreshWatchPaths: Bool = false) {
     repoPositions = Dictionary(uniqueKeysWithValues: snapshot.repos.enumerated().map { ($0.element.path, $0.offset) })
-    repositoryWatchPaths = Dictionary(uniqueKeysWithValues: snapshot.repos.map { repo in
-      let paths = [repo.path] + repo.gitDirectories
-      return (repo.path, environment.kind == .local ? paths.map(LocalWatcher.physicalPath) : paths)
-    })
+    repositoryWatchPaths.reconcile(snapshot.repos, local: environment.kind == .local, refresh: refreshWatchPaths)
   }
   private var snapshot: EnvironmentSnapshot
   private var loop: Task<Void, Never>?, debounce: Task<Void, Never>?
@@ -31,6 +28,9 @@ public actor EnvironmentMonitor {
   private var sweepRetryAt = Date.distantPast
   private var capabilities: Capabilities?
   private var watcherGeneration = UUID()
+  private var watcherCoverage: WatcherCoverage?
+  private var resetWatcherCoverage = false
+  private(set) var watcherStarts = 0
   private var activeSweep: Task<Void, Never>?
   private var lastReconnectResolution = Date.distantPast
   private var safetySwept = Date.distantPast
@@ -218,18 +218,18 @@ public actor EnvironmentMonitor {
           repo.awaitingFreshCheck = true
           return repo
         })
-        indexRepositories()
+        indexRepositories(refreshWatchPaths: rediscovered)
         // Successful discovery is authoritative even if the previous connection failed.
         // Clear that error before merging, so an empty discovery can remove stale copies.
         snapshot.error = nil
         await store.merge(snapshot)
       }
       // Watch while probing so edits made during a large sweep queue a follow-up.
-      if rediscovered { stopWatchers() }
       await startWatcher()
       // Publish host-local Git state before contacting any repository upstream.
       // A large inventory or an unreachable upstream must not hide reachable hosts.
-      try await probeBatches(paths, peerMap: peerMap, upstream: .off, batchSize: 8)
+      try await probeBatches(paths, peerMap: peerMap, upstream: .off, batchSize: 8,
+                             reuseFacts: !rediscovered && !forceUpstream)
       guard !stopped, !Task.isCancelled else { return }
       if full || rediscovered {
         if safetyDue { safetySwept = Date() }
@@ -266,20 +266,26 @@ public actor EnvironmentMonitor {
     }
   }
   private func probeBatches(
-    _ paths: [String], peerMap: [String: [String]], upstream: UpstreamCheck, batchSize: Int
+    _ paths: [String], peerMap: [String: [String]], upstream: UpstreamCheck, batchSize: Int, reuseFacts: Bool = false
   ) async throws {
-    for start in stride(from: 0, to: paths.count, by: batchSize) {
+    let batches = upstream == .off
+      ? stride(from: 0, to: paths.count, by: batchSize).map { Array(paths[$0..<min($0 + batchSize, paths.count)]) }
+      : Probe.upstreamBatches(paths.compactMap { repoPositions[$0].map { snapshot.repos[$0] } }, size: batchSize)
+    var start = 0
+    for batch in batches {
+      defer { start += batch.count }
       try Task.checkCancellation()
       guard !stopped else { throw CancellationError() }
       snapshot.checkProgress = upstream == .off
         ? "Checking repositories: \(start) of \(paths.count)"
         : "Checking upstreams: \(start) of \(paths.count) · repository status available"
       await store.updateProgress(snapshot.checkProgress, for: environment.id)
-      let end = min(start + batchSize, paths.count)
-      let batch = Array(paths[start..<end])
       let repos: [RepoSnapshot]
       if upstream == .off {
-        repos = try await Probe.repos(batch, peerMap: peerMap, using: transport)
+        let previous: [String: RepoSnapshot] = reuseFacts ? Dictionary(uniqueKeysWithValues: batch.compactMap { path in
+          repoPositions[path].map { (path, snapshot.repos[$0]) }
+        }) : [:]
+        repos = try await Probe.repos(batch, peerMap: peerMap, previous: previous, using: transport)
       } else {
         repos = try await Probe.checkUpstreams(batch.compactMap { path in
           repoPositions[path].map { snapshot.repos[$0] }
@@ -302,8 +308,7 @@ public actor EnvironmentMonitor {
       for path in batch {
         guard let index = repoPositions[path] else { continue }
         let repo = snapshot.repos[index]
-        let paths = [repo.path] + repo.gitDirectories
-        repositoryWatchPaths[path] = environment.kind == .local ? paths.map(LocalWatcher.physicalPath) : paths
+        repositoryWatchPaths.update(repo, local: environment.kind == .local)
       }
       if let watcher = localWatcher, batch.contains(where: { path in
         (repositoryWatchPaths[path] ?? []).contains { candidate in
@@ -323,9 +328,14 @@ public actor EnvironmentMonitor {
       snapshot.mode = "Polling"
       return
     }
-    guard localWatcher == nil, remoteWatcher == nil, Date() >= retryAt, let capabilities else {
-      return
-    }
+    guard let capabilities else { return }
+    let coverage = WatcherCoverage(roots: environment.roots, repos: snapshot.repos)
+    if localWatcher != nil || remoteWatcher != nil {
+      guard resetWatcherCoverage || watcherCoverage != coverage else { return }
+      stopWatchers()
+    } else if Date() < retryAt { return }
+    resetWatcherCoverage = false
+    snapshot.watcherCoverageWarning = nil
     do {
       watcherGeneration = UUID()
       let generation = watcherGeneration
@@ -340,7 +350,7 @@ public actor EnvironmentMonitor {
       } else if capabilities.python || capabilities.inotifywait || capabilities.fswatch {
         remoteWatcher = try RemoteWatcher(
           transport: transport, roots: environment.roots, repos: snapshot.repos.map(\.path),
-          capabilities: capabilities, handler: handler)
+          capabilities: capabilities, gitDirectories: coverage.gitDirectories, handler: handler)
         snapshot.mode =
           "Events — \(capabilities.python ? (capabilities.os == "Linux" ? "inotify via python3" : "FSEvents via python3") : capabilities.inotifywait ? "inotifywait" : "fswatch")"
         lastHeartbeat = Date()
@@ -348,6 +358,7 @@ public actor EnvironmentMonitor {
         snapshot.mode = "Polling — no event tools available"
         retryAt = Date().addingTimeInterval(300)
       }
+      if localWatcher != nil || remoteWatcher != nil { watcherCoverage = coverage; watcherStarts += 1 }
     } catch { await watcherFailed(error.localizedDescription) }
   }
   private func event(_ event: WatchEvent, generation: UUID) async {
@@ -365,38 +376,39 @@ public actor EnvironmentMonitor {
     case .ping: lastHeartbeat = Date()
     case .ended: await watcherFailed("Remote watcher ended unexpectedly")
     case .failed(let message): await watcherFailed(message)
-    case .limited:
+    case .limited(let message):
       snapshot.mode += snapshot.mode.contains("limited") ? "" : " (limited; safety sweep active)"
+      snapshot.watcherCoverageWarning = message
+      await store.merge(snapshot, changedPaths: [])
+    case .reset:
+      resetWatcherCoverage = true
+      await self.event(.rescan, generation: generation)
     case .rescan:
+      repositoryWatchPaths.invalidateAll()
       forceDiscovery = true
       scheduleDebounce()
     case .changed(let path): await repositoryChanged(path)
+    case .changedPaths(let paths):
+      for path in paths { await repositoryChanged(path, debounce: false) }
+      if !changed.isEmpty || forceDiscovery { scheduleDebounce() }
     }
   }
   // Used by both filesystem watcher backends; retain affected paths while a sweep is busy.
-  func repositoryChanged(_ path: String) async {
+  func repositoryChanged(_ path: String, debounce: Bool = true) async {
     guard !stopped else { return }
     if environment.kind == .local, await store.isCachePath(path) { return }
+    if environment.kind == .local { repositoryWatchPaths.invalidate(affectedPath: path) }
     let path = environment.kind == .local ? LocalWatcher.physicalPath(path) : path
-    let skipped: Set<String> = [
-      "node_modules", ".venv", "vendor", "target", "build", "Library", ".Trash",
-    ]
-    if let repo = snapshot.repos.first(where: {
-      guard let root = repositoryWatchPaths[$0.path]?.first else { return false }
-      return path.hasPrefix(root + "/")
-    }), let root = repositoryWatchPaths[repo.path]?.first {
-      let relative = path.dropFirst(root.count + 1)
-      if relative.split(separator: "/").contains(where: { skipped.contains(String($0)) }) {
-        return
-      }
-    } else if path.split(separator: "/").contains(where: { skipped.contains(String($0)) }) {
-      return
+    let matches = repositoryWatchPaths.repositories(containing: path)
+    if matches.isEmpty {
+      if repositoryWatchPaths.ignores(path) { return }
+      forceDiscovery = true
+    } else {
+      let relevant = matches.filter { !repositoryWatchPaths.ignores(path, repository: $0) }
+      guard !relevant.isEmpty else { return }
+      changed.formUnion(relevant)
     }
-    let matches = snapshot.repos.filter {
-      (repositoryWatchPaths[$0.path] ?? [$0.path]).contains { path == $0 || path.hasPrefix($0 + "/") }
-    }
-    if matches.isEmpty { forceDiscovery = true } else { changed.formUnion(matches.map(\.path)) }
-    scheduleDebounce()
+    if debounce { scheduleDebounce() }
   }
 
   private func scheduleDebounce() {
@@ -410,6 +422,7 @@ public actor EnvironmentMonitor {
   }
   private func stopWatchers() {
     watcherGeneration = UUID()
+    watcherCoverage = nil
     localWatcher?.stop()
     localWatcher = nil
     remoteWatcher?.stop()
@@ -443,5 +456,18 @@ enum MonitorDeadline {
     if !events && canRetryWatcher { dates.append(retryWatcher) }
     if remote { dates.append(heartbeat.addingTimeInterval(65)) }
     return dates.min().map { max(now, $0) }
+  }
+}
+
+/// Order-independent coverage identity; timestamps and content changes do not restart watchers.
+struct WatcherCoverage: Equatable {
+  let roots: Set<String>
+  let repositories: Set<String>
+  let gitDirectories: [String: [String]]
+  init(roots: [String], repos: SnapshotList<RepoSnapshot>) {
+    self.roots = Set(roots)
+    repositories = Set(repos.map(\.path))
+    gitDirectories = Dictionary(uniqueKeysWithValues: repos.filter { !$0.gitDirectories.isEmpty }
+      .map { ($0.path, Set($0.gitDirectories).sorted()) })
   }
 }

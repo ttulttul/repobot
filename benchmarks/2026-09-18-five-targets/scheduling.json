@@ -1,0 +1,346 @@
+{
+  "metadata": {
+    "label": "final-scheduling",
+    "utc": "2026-09-18T17:01:29.717782+00:00",
+    "git_head": "8bdc2f2ed96a2ed896cb1e50d1234ec051b39717",
+    "source_sha256": "2ebcead5897bbf5dfcf201d201b03f1d1fa43099f08cd664b25b334bc571745f",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "cpu": "Apple M2 Max",
+    "workload_version": 101,
+    "copies": 720,
+    "repeats": 5,
+    "measurement": "getrusage user+system CPU; Git suite includes RUSAGE_CHILDREN; wall clock; setup excluded",
+    "source_archive": "scheduling.sources.tar.gz",
+    "compiler_version": "Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)\nTarget: arm64-apple-macosx26.0",
+    "binaries_sha256": {
+      "RepobotPackageTests": "90734b21fd581f26ab55d53eb20fe8e6f30c38e2590505c2acabaa4b684c7b0b"
+    },
+    "command": [
+      "./scripts/swift.sh",
+      "test",
+      "-c",
+      "release",
+      "--skip-build",
+      "--filter",
+      "SchedulingPerformanceTests"
+    ]
+  },
+  "runs": [
+    [
+      {
+        "counters": {
+          "clones_counted": 360000
+        },
+        "cpu_ms_per_op": 1.0781220000000002,
+        "operations": 500,
+        "wall_ms_per_op": 1.1008636951446533,
+        "workload": "attention_full_reference"
+      },
+      {
+        "counters": {
+          "clones_visited": 500
+        },
+        "cpu_ms_per_op": 0.0034120000000006094,
+        "operations": 500,
+        "wall_ms_per_op": 0.003330707550048828,
+        "workload": "attention_incremental"
+      },
+      {
+        "counters": {
+          "repository_comparisons": 7200000
+        },
+        "cpu_ms_per_op": 0.16549400000000067,
+        "operations": 10000,
+        "wall_ms_per_op": 0.1659557580947876,
+        "workload": "event_scan_reference"
+      },
+      {
+        "counters": {
+          "path_lookups": 50000
+        },
+        "cpu_ms_per_op": 0.011213100000000465,
+        "operations": 10000,
+        "wall_ms_per_op": 0.011270833015441895,
+        "workload": "event_indexed"
+      }
+    ],
+    [
+      {
+        "counters": {
+          "clones_counted": 360000
+        },
+        "cpu_ms_per_op": 1.05487,
+        "operations": 500,
+        "wall_ms_per_op": 1.057950735092163,
+        "workload": "attention_full_reference"
+      },
+      {
+        "counters": {
+          "clones_visited": 500
+        },
+        "cpu_ms_per_op": 0.003168000000000795,
+        "operations": 500,
+        "wall_ms_per_op": 0.0030906200408935547,
+        "workload": "attention_incremental"
+      },
+      {
+        "counters": {
+          "repository_comparisons": 7200000
+        },
+        "cpu_ms_per_op": 0.1671466999999966,
+        "operations": 10000,
+        "wall_ms_per_op": 0.16773325204849243,
+        "workload": "event_scan_reference"
+      },
+      {
+        "counters": {
+          "path_lookups": 50000
+        },
+        "cpu_ms_per_op": 0.01333770000000234,
+        "operations": 10000,
+        "wall_ms_per_op": 0.013419055938720703,
+        "workload": "event_indexed"
+      }
+    ],
+    [
+      {
+        "counters": {
+          "clones_counted": 360000
+        },
+        "cpu_ms_per_op": 1.0493159999999997,
+        "operations": 500,
+        "wall_ms_per_op": 1.051213264465332,
+        "workload": "attention_full_reference"
+      },
+      {
+        "counters": {
+          "clones_visited": 500
+        },
+        "cpu_ms_per_op": 0.002814000000001399,
+        "operations": 500,
+        "wall_ms_per_op": 0.0027730464935302734,
+        "workload": "attention_incremental"
+      },
+      {
+        "counters": {
+          "repository_comparisons": 7200000
+        },
+        "cpu_ms_per_op": 0.16750629999999858,
+        "operations": 10000,
+        "wall_ms_per_op": 0.16880613565444946,
+        "workload": "event_scan_reference"
+      },
+      {
+        "counters": {
+          "path_lookups": 50000
+        },
+        "cpu_ms_per_op": 0.010504300000001143,
+        "operations": 10000,
+        "wall_ms_per_op": 0.010601544380187988,
+        "workload": "event_indexed"
+      }
+    ],
+    [
+      {
+        "counters": {
+          "clones_counted": 360000
+        },
+        "cpu_ms_per_op": 1.0609659999999987,
+        "operations": 500,
+        "wall_ms_per_op": 1.064039945602417,
+        "workload": "attention_full_reference"
+      },
+      {
+        "counters": {
+          "clones_visited": 500
+        },
+        "cpu_ms_per_op": 0.0032539999999999236,
+        "operations": 500,
+        "wall_ms_per_op": 0.0031621456146240234,
+        "workload": "attention_incremental"
+      },
+      {
+        "counters": {
+          "repository_comparisons": 7200000
+        },
+        "cpu_ms_per_op": 0.16666010000000026,
+        "operations": 10000,
+        "wall_ms_per_op": 0.16733232736587525,
+        "workload": "event_scan_reference"
+      },
+      {
+        "counters": {
+          "path_lookups": 50000
+        },
+        "cpu_ms_per_op": 0.013601000000000073,
+        "operations": 10000,
+        "wall_ms_per_op": 0.013649547100067138,
+        "workload": "event_indexed"
+      }
+    ],
+    [
+      {
+        "counters": {
+          "clones_counted": 360000
+        },
+        "cpu_ms_per_op": 1.0739839999999996,
+        "operations": 500,
+        "wall_ms_per_op": 1.0837323665618896,
+        "workload": "attention_full_reference"
+      },
+      {
+        "counters": {
+          "clones_visited": 500
+        },
+        "cpu_ms_per_op": 0.00333800000000041,
+        "operations": 500,
+        "wall_ms_per_op": 0.003278017044067383,
+        "workload": "attention_incremental"
+      },
+      {
+        "counters": {
+          "repository_comparisons": 7200000
+        },
+        "cpu_ms_per_op": 0.16395459999999795,
+        "operations": 10000,
+        "wall_ms_per_op": 0.16439749002456666,
+        "workload": "event_scan_reference"
+      },
+      {
+        "counters": {
+          "path_lookups": 50000
+        },
+        "cpu_ms_per_op": 0.009807599999999639,
+        "operations": 10000,
+        "wall_ms_per_op": 0.009854626655578614,
+        "workload": "event_indexed"
+      }
+    ]
+  ],
+  "summary": {
+    "attention_full_reference": {
+      "cpu_ms_per_op": {
+        "median": 1.0609659999999987,
+        "min": 1.0493159999999997,
+        "max": 1.0781220000000002,
+        "mad": 0.01164999999999905
+      },
+      "wall_ms_per_op": {
+        "median": 1.064039945602417,
+        "min": 1.051213264465332,
+        "max": 1.1008636951446533,
+        "mad": 0.012826681137084961
+      },
+      "counters": [
+        {
+          "clones_counted": 360000
+        },
+        {
+          "clones_counted": 360000
+        },
+        {
+          "clones_counted": 360000
+        },
+        {
+          "clones_counted": 360000
+        },
+        {
+          "clones_counted": 360000
+        }
+      ]
+    },
+    "attention_incremental": {
+      "cpu_ms_per_op": {
+        "median": 0.0032539999999999236,
+        "min": 0.002814000000001399,
+        "max": 0.0034120000000006094,
+        "mad": 8.599999999912844e-05
+      },
+      "wall_ms_per_op": {
+        "median": 0.0031621456146240234,
+        "min": 0.0027730464935302734,
+        "max": 0.003330707550048828,
+        "mad": 0.00011587142944335938
+      },
+      "counters": [
+        {
+          "clones_visited": 500
+        },
+        {
+          "clones_visited": 500
+        },
+        {
+          "clones_visited": 500
+        },
+        {
+          "clones_visited": 500
+        },
+        {
+          "clones_visited": 500
+        }
+      ]
+    },
+    "event_scan_reference": {
+      "cpu_ms_per_op": {
+        "median": 0.16666010000000026,
+        "min": 0.16395459999999795,
+        "max": 0.16750629999999858,
+        "mad": 0.0008461999999983261
+      },
+      "wall_ms_per_op": {
+        "median": 0.16733232736587525,
+        "min": 0.16439749002456666,
+        "max": 0.16880613565444946,
+        "mad": 0.0013765692710876465
+      },
+      "counters": [
+        {
+          "repository_comparisons": 7200000
+        },
+        {
+          "repository_comparisons": 7200000
+        },
+        {
+          "repository_comparisons": 7200000
+        },
+        {
+          "repository_comparisons": 7200000
+        },
+        {
+          "repository_comparisons": 7200000
+        }
+      ]
+    },
+    "event_indexed": {
+      "cpu_ms_per_op": {
+        "median": 0.011213100000000465,
+        "min": 0.009807599999999639,
+        "max": 0.013601000000000073,
+        "mad": 0.0014055000000008262
+      },
+      "wall_ms_per_op": {
+        "median": 0.011270833015441895,
+        "min": 0.009854626655578614,
+        "max": 0.013649547100067138,
+        "mad": 0.0014162063598632812
+      },
+      "counters": [
+        {
+          "path_lookups": 50000
+        },
+        {
+          "path_lookups": 50000
+        },
+        {
+          "path_lookups": 50000
+        },
+        {
+          "path_lookups": 50000
+        },
+        {
+          "path_lookups": 50000
+        }
+      ]
+    }
+  }
+}

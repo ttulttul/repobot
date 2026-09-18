@@ -6,3 +6,4 @@ DerivedData/
 dist/
 .swiftpm/
 __pycache__/
+.benchmark-results/

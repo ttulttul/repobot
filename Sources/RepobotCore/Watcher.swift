@@ -4,13 +4,15 @@ import Foundation
 public enum WatchEvent: Sendable {
   case ready, ping
   case changed(String)
-  case rescan
+  case changedPaths([String])
+  case rescan, reset
   case limited(String)
   case ended, failed(String)
 }
 public final class LocalWatcher: @unchecked Sendable {
   private var stream: FSEventStreamRef?
   private let handler: @Sendable (WatchEvent) -> Void
+  private let batcher: WatchEventBatcher
   private let queue = DispatchQueue(label: "Repobot.FSEvents")
   let watchedRoots: [String]
   // FSEvents watches recursively. WatchRoot consumes descriptors for explicit paths;
@@ -44,7 +46,9 @@ public final class LocalWatcher: @unchecked Sendable {
     return .message("Could not \(operation) local filesystem watcher (\(roots) watch roots; file-descriptor limit \(limit.rlim_cur); \(detail), errno \(code))")
   }
   public init(roots: [String], handler: @escaping @Sendable (WatchEvent) -> Void) throws {
-    self.handler = handler
+    let batcher = WatchEventBatcher(handler: handler)
+    self.batcher = batcher
+    self.handler = { batcher.send($0) }
     watchedRoots = Self.compactRoots(roots)
     guard !watchedRoots.isEmpty else { throw RepobotError.message("No local filesystem watch roots configured") }
     var context = FSEventStreamContext(
@@ -58,7 +62,10 @@ public final class LocalWatcher: @unchecked Sendable {
         | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped
         | kFSEventStreamEventFlagRootChanged | kFSEventStreamEventFlagMount | kFSEventStreamEventFlagUnmount)
       for i in 0..<count {
-        if flags[i] & rescanFlags != 0 { watcher.handler(.rescan) }
+        if flags[i] & rescanFlags != 0 {
+          let rootFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged | kFSEventStreamEventFlagMount | kFSEventStreamEventFlagUnmount)
+          watcher.handler(flags[i] & rootFlags != 0 ? .reset : .rescan)
+        }
         let path = String(cString: strings[i])
         watcher.handler(.changed(path))
       }
@@ -84,6 +91,7 @@ public final class LocalWatcher: @unchecked Sendable {
     handler(.ready)
   }
   public func stop() {
+    batcher.stop()
     guard let stream else { return }
     FSEventStreamStop(stream)
     FSEventStreamInvalidate(stream)
@@ -94,10 +102,11 @@ public final class LocalWatcher: @unchecked Sendable {
   deinit { stop() }
 }
 public final class RemoteWatcher: @unchecked Sendable {
+  private let batcher: WatchEventBatcher
   private let task: Task<Void, Never>
   public init(
     transport: any Transport, roots: [String], repos: [String], capabilities: Capabilities,
-    handler: @escaping @Sendable (WatchEvent) -> Void
+    gitDirectories: [String: [String]] = [:], handler: @escaping @Sendable (WatchEvent) -> Void
   ) throws {
     let script: String
     let program: String
@@ -105,10 +114,12 @@ public final class RemoteWatcher: @unchecked Sendable {
     if capabilities.python {
       program = "python3"
       args = ["-"] + roots + ["--"] + repos
-      script = try Scripts.load("watcher.py")
+      let inventory = try JSONEncoder().encode(gitDirectories).base64EncodedString()
+      script = "import json, base64\nknown_git_directories = json.loads(base64.b64decode('" + inventory + "'))\n"
+        + (try Scripts.load("watcher.py"))
     } else {
       program = "sh"
-      args = ["-s", "--"] + roots + repos
+      args = ["-s", "--"] + roots + repos + gitDirectories.values.flatMap { $0 }
       let command =
         capabilities.inotifywait
         ? "inotifywait -q -m -r -e modify,attrib,move,create,delete -- \"$@\""
@@ -128,7 +139,9 @@ public final class RemoteWatcher: @unchecked Sendable {
         """
     }
     let (executable, arguments) = transport.invocation(program: program, arguments: args)
-    let parser = WatchParser(handler: handler)
+    let batcher = WatchEventBatcher(handler: handler)
+    self.batcher = batcher
+    let parser = WatchParser { batcher.send($0) }
     task = Task {
       do {
         let result = try await ProcessRunner.run(
@@ -144,7 +157,7 @@ public final class RemoteWatcher: @unchecked Sendable {
       }
     }
   }
-  public func stop() { task.cancel() }
+  public func stop() { batcher.stop(); task.cancel() }
   deinit { stop() }
 }
 
@@ -167,6 +180,7 @@ private final class WatchParser: @unchecked Sendable {
         case "READY": handler(.ready)
         case "PING": handler(.ping)
         case "RESCAN": handler(.rescan)
+        case "RESET": handler(.reset)
         case "CHANGED", "LIMIT": pending = value
         default: break
         }
@@ -178,4 +192,55 @@ private final class WatchParser: @unchecked Sendable {
       handler(.rescan)
     }
   }
+}
+
+/// Coalesce before crossing into the monitor actor: one callback per burst, not per file.
+final class WatchEventBatcher: @unchecked Sendable {
+  private let lock = NSLock()
+  private var paths = Set<String>()
+  private var scheduled = false, active = true, overflow = false
+  private let delay: Double
+  private let handler: @Sendable (WatchEvent) -> Void
+  init(delay: Double = 0.05, handler: @escaping @Sendable (WatchEvent) -> Void) {
+    self.delay = delay; self.handler = handler
+  }
+  func send(_ event: WatchEvent) {
+    switch event {
+    case .changed(let path): enqueue([path])
+    case .changedPaths(let paths): enqueue(paths)
+    default:
+      let deliver = lock.withLock { () -> Bool in
+        guard active else { return false }
+        if case .rescan = event { paths.removeAll(); overflow = false }
+        if case .reset = event { paths.removeAll(); overflow = false }
+        return true
+      }
+      if deliver { handler(event) }
+    }
+  }
+  private func enqueue(_ incoming: [String]) {
+    let schedule = lock.withLock { () -> Bool in
+      guard active else { return false }
+      if !overflow {
+        paths.formUnion(incoming)
+        if paths.count > 4096 { paths.removeAll(); overflow = true }
+      }
+      guard !scheduled else { return false }
+      scheduled = true; return true
+    }
+    if schedule {
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in self?.flush() }
+    }
+  }
+  func flush() {
+    let event = lock.withLock { () -> WatchEvent? in
+      scheduled = false
+      guard active else { return nil }
+      defer { paths.removeAll(keepingCapacity: true); overflow = false }
+      if overflow { return .rescan }
+      return paths.isEmpty ? nil : .changedPaths(paths.sorted())
+    }
+    if let event { handler(event) }
+  }
+  func stop() { lock.withLock { active = false; paths.removeAll(); overflow = false } }
 }

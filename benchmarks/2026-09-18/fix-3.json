@@ -1,0 +1,420 @@
+{
+  "metadata": {
+    "label": "fix-3-watch-path-cache",
+    "utc": "2026-09-18T14:51:24.802024+00:00",
+    "git_head": "8bdc2f2ed96a2ed896cb1e50d1234ec051b39717",
+    "source_sha256": "4675c16f52f557e61b2d6a107290bf9dcf383424c1a75e322785d9839ce67cba",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "cpu": "Apple M2 Max",
+    "workload_version": 1,
+    "copies": 720,
+    "repeats": 5,
+    "measurement": "getrusage(RUSAGE_SELF) user+system CPU; wall clock; warmup excluded",
+    "binaries_sha256": {
+      "RepobotPackageTests": "fcdb565b4cc0ecf4972bbec31850574a28c2396c4105c26e0cacfb49350c9eb8"
+    },
+    "command": [
+      "./scripts/swift.sh",
+      "test",
+      "-c",
+      "release",
+      "--skip-build",
+      "--filter",
+      "PerformanceBenchmarkTests"
+    ]
+  },
+  "runs": [
+    [
+      {
+        "counters": {
+          "visited_rows": 2700
+        },
+        "cpu_ms_per_op": 0.2910666666666668,
+        "operations": 300,
+        "wall_ms_per_op": 0.2908535798390706,
+        "workload": "map_coalesced"
+      },
+      {
+        "counters": {},
+        "cpu_ms_per_op": 0.43375,
+        "operations": 300,
+        "wall_ms_per_op": 0.4337469736735026,
+        "workload": "analysis_and_map"
+      },
+      {
+        "counters": {
+          "encoded_records": 0,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.4469900000000002,
+        "operations": 100,
+        "wall_ms_per_op": 0.525890588760376,
+        "workload": "persistence_freshness"
+      },
+      {
+        "counters": {
+          "encoded_records": 400,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.5040500000000003,
+        "operations": 100,
+        "wall_ms_per_op": 0.578160285949707,
+        "workload": "persistence_facts"
+      },
+      {
+        "counters": {
+          "resolved_paths": 0
+        },
+        "cpu_ms_per_op": 0.001721000000000028,
+        "operations": 1000,
+        "wall_ms_per_op": 0.0017200708389282227,
+        "workload": "watch_paths_unchanged"
+      }
+    ],
+    [
+      {
+        "counters": {
+          "visited_rows": 2700
+        },
+        "cpu_ms_per_op": 0.2821233333333339,
+        "operations": 300,
+        "wall_ms_per_op": 0.2821969985961914,
+        "workload": "map_coalesced"
+      },
+      {
+        "counters": {},
+        "cpu_ms_per_op": 0.42436,
+        "operations": 300,
+        "wall_ms_per_op": 0.424500306447347,
+        "workload": "analysis_and_map"
+      },
+      {
+        "counters": {
+          "encoded_records": 0,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.41313999999999995,
+        "operations": 100,
+        "wall_ms_per_op": 0.49693942070007324,
+        "workload": "persistence_freshness"
+      },
+      {
+        "counters": {
+          "encoded_records": 400,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.5463800000000002,
+        "operations": 100,
+        "wall_ms_per_op": 0.6318902969360352,
+        "workload": "persistence_facts"
+      },
+      {
+        "counters": {
+          "resolved_paths": 0
+        },
+        "cpu_ms_per_op": 0.0017399999999999638,
+        "operations": 1000,
+        "wall_ms_per_op": 0.0017369985580444336,
+        "workload": "watch_paths_unchanged"
+      }
+    ],
+    [
+      {
+        "counters": {
+          "visited_rows": 2700
+        },
+        "cpu_ms_per_op": 0.29525999999999847,
+        "operations": 300,
+        "wall_ms_per_op": 0.29510219891866046,
+        "workload": "map_coalesced"
+      },
+      {
+        "counters": {},
+        "cpu_ms_per_op": 0.43813666666666656,
+        "operations": 300,
+        "wall_ms_per_op": 0.4382503032684326,
+        "workload": "analysis_and_map"
+      },
+      {
+        "counters": {
+          "encoded_records": 0,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.4122699999999998,
+        "operations": 100,
+        "wall_ms_per_op": 0.4892599582672119,
+        "workload": "persistence_freshness"
+      },
+      {
+        "counters": {
+          "encoded_records": 400,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.5035600000000001,
+        "operations": 100,
+        "wall_ms_per_op": 0.5805909633636475,
+        "workload": "persistence_facts"
+      },
+      {
+        "counters": {
+          "resolved_paths": 0
+        },
+        "cpu_ms_per_op": 0.0017119999999999913,
+        "operations": 1000,
+        "wall_ms_per_op": 0.0017119646072387695,
+        "workload": "watch_paths_unchanged"
+      }
+    ],
+    [
+      {
+        "counters": {
+          "visited_rows": 2700
+        },
+        "cpu_ms_per_op": 0.2938033333333349,
+        "operations": 300,
+        "wall_ms_per_op": 0.29386599858601886,
+        "workload": "map_coalesced"
+      },
+      {
+        "counters": {},
+        "cpu_ms_per_op": 0.4427733333333333,
+        "operations": 300,
+        "wall_ms_per_op": 0.4430266221364339,
+        "workload": "analysis_and_map"
+      },
+      {
+        "counters": {
+          "encoded_records": 0,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.42356,
+        "operations": 100,
+        "wall_ms_per_op": 0.5101597309112549,
+        "workload": "persistence_freshness"
+      },
+      {
+        "counters": {
+          "encoded_records": 400,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.5010199999999998,
+        "operations": 100,
+        "wall_ms_per_op": 0.5850696563720703,
+        "workload": "persistence_facts"
+      },
+      {
+        "counters": {
+          "resolved_paths": 0
+        },
+        "cpu_ms_per_op": 0.0016940000000000288,
+        "operations": 1000,
+        "wall_ms_per_op": 0.0016940832138061523,
+        "workload": "watch_paths_unchanged"
+      }
+    ],
+    [
+      {
+        "counters": {
+          "visited_rows": 2700
+        },
+        "cpu_ms_per_op": 0.2879033333333336,
+        "operations": 300,
+        "wall_ms_per_op": 0.2880271275838216,
+        "workload": "map_coalesced"
+      },
+      {
+        "counters": {},
+        "cpu_ms_per_op": 0.4281766666666666,
+        "operations": 300,
+        "wall_ms_per_op": 0.42816638946533203,
+        "workload": "analysis_and_map"
+      },
+      {
+        "counters": {
+          "encoded_records": 0,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.42940000000000006,
+        "operations": 100,
+        "wall_ms_per_op": 0.5136001110076904,
+        "workload": "persistence_freshness"
+      },
+      {
+        "counters": {
+          "encoded_records": 400,
+          "examined_records": 400
+        },
+        "cpu_ms_per_op": 0.5010799999999999,
+        "operations": 100,
+        "wall_ms_per_op": 0.5834197998046875,
+        "workload": "persistence_facts"
+      },
+      {
+        "counters": {
+          "resolved_paths": 0
+        },
+        "cpu_ms_per_op": 0.001693,
+        "operations": 1000,
+        "wall_ms_per_op": 0.001690983772277832,
+        "workload": "watch_paths_unchanged"
+      }
+    ]
+  ],
+  "summary": {
+    "map_coalesced": {
+      "cpu_ms_per_op": {
+        "median": 0.2910666666666668,
+        "min": 0.2821233333333339,
+        "max": 0.29525999999999847,
+        "mad": 0.0031633333333331848
+      },
+      "wall_ms_per_op": {
+        "median": 0.2908535798390706,
+        "min": 0.2821969985961914,
+        "max": 0.29510219891866046,
+        "mad": 0.003012418746948242
+      },
+      "counters": [
+        {
+          "visited_rows": 2700
+        },
+        {
+          "visited_rows": 2700
+        },
+        {
+          "visited_rows": 2700
+        },
+        {
+          "visited_rows": 2700
+        },
+        {
+          "visited_rows": 2700
+        }
+      ]
+    },
+    "analysis_and_map": {
+      "cpu_ms_per_op": {
+        "median": 0.43375,
+        "min": 0.42436,
+        "max": 0.4427733333333333,
+        "mad": 0.00557333333333343
+      },
+      "wall_ms_per_op": {
+        "median": 0.4337469736735026,
+        "min": 0.424500306447347,
+        "max": 0.4430266221364339,
+        "mad": 0.005580584208170591
+      },
+      "counters": [
+        {},
+        {},
+        {},
+        {},
+        {}
+      ]
+    },
+    "persistence_freshness": {
+      "cpu_ms_per_op": {
+        "median": 0.42356,
+        "min": 0.4122699999999998,
+        "max": 0.4469900000000002,
+        "mad": 0.01042000000000004
+      },
+      "wall_ms_per_op": {
+        "median": 0.5101597309112549,
+        "min": 0.4892599582672119,
+        "max": 0.525890588760376,
+        "mad": 0.01322031021118164
+      },
+      "counters": [
+        {
+          "encoded_records": 0,
+          "examined_records": 400
+        },
+        {
+          "encoded_records": 0,
+          "examined_records": 400
+        },
+        {
+          "encoded_records": 0,
+          "examined_records": 400
+        },
+        {
+          "encoded_records": 0,
+          "examined_records": 400
+        },
+        {
+          "encoded_records": 0,
+          "examined_records": 400
+        }
+      ]
+    },
+    "persistence_facts": {
+      "cpu_ms_per_op": {
+        "median": 0.5035600000000001,
+        "min": 0.5010199999999998,
+        "max": 0.5463800000000002,
+        "mad": 0.0024800000000002598
+      },
+      "wall_ms_per_op": {
+        "median": 0.5834197998046875,
+        "min": 0.578160285949707,
+        "max": 0.6318902969360352,
+        "mad": 0.002828836441040039
+      },
+      "counters": [
+        {
+          "encoded_records": 400,
+          "examined_records": 400
+        },
+        {
+          "encoded_records": 400,
+          "examined_records": 400
+        },
+        {
+          "encoded_records": 400,
+          "examined_records": 400
+        },
+        {
+          "encoded_records": 400,
+          "examined_records": 400
+        },
+        {
+          "encoded_records": 400,
+          "examined_records": 400
+        }
+      ]
+    },
+    "watch_paths_unchanged": {
+      "cpu_ms_per_op": {
+        "median": 0.0017119999999999913,
+        "min": 0.001693,
+        "max": 0.0017399999999999638,
+        "mad": 1.799999999996249e-05
+      },
+      "wall_ms_per_op": {
+        "median": 0.0017119646072387695,
+        "min": 0.001690983772277832,
+        "max": 0.0017369985580444336,
+        "mad": 1.7881393432617188e-05
+      },
+      "counters": [
+        {
+          "resolved_paths": 0
+        },
+        {
+          "resolved_paths": 0
+        },
+        {
+          "resolved_paths": 0
+        },
+        {
+          "resolved_paths": 0
+        },
+        {
+          "resolved_paths": 0
+        }
+      ]
+    }
+  }
+}

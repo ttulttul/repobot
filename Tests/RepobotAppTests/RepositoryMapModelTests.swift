@@ -55,6 +55,7 @@ private final class MapChangeCounter: @unchecked Sendable {
       for host in envs.indices {
         for repo in envs[host].repos.indices {
           envs[host].repos[repo].probedAt = Date(timeIntervalSince1970: Double(1_800_000_000 + index))
+          envs[host].repos[repo].probeFingerprint = "cache-bookkeeping-\(index)"
         }
       }
       model.update(analyzer.analyze(envs, configuration: Configuration()))
@@ -162,7 +163,7 @@ private final class MapChangeCounter: @unchecked Sendable {
     _ = change(13) // AsyncStream may replace this publication before the UI sees it.
     world = change(14)
     model.update(world)
-    #expect(model.visitedRows - visited == 240)
+    #expect(model.visitedRows - visited == 6)
     compare(model, world)
     for index in [12, 13, 14] {
       let group = try #require(model.visibleGroups.first { $0.id.hasSuffix("/\(index)") })
@@ -172,6 +173,64 @@ private final class MapChangeCounter: @unchecked Sendable {
     world = change(15)
     model.update(world)
     #expect(model.visitedRows - refreshed == 3)
+  }
+
+  @Test func testHistoryExpiryStructuralChangesAndNewAnalyzerReconcile() {
+    var envs = inventory(), analyzer = IncrementalAnalyzer()
+    let model = RepositoryMapModel(), config = Configuration()
+    model.update(analyzer.analyze(envs, configuration: config))
+    let initial = model.visitedRows
+    var world = WorldSnapshot()
+    for step in 0..<70 {
+      envs[0].repos[step].modified = 1
+      let repo = envs[0].repos[step]
+      world = analyzer.analyze(envs, configuration: config, changes: [
+        RepositoryID(environment: envs[0].id, path: repo.path): RepositoryChange(repo: repo, position: step)])
+    }
+    #expect(world.changes?.history?.count == 64)
+    model.update(world)
+    #expect(model.visitedRows - initial == 240)
+    compare(model, world)
+    let visited = model.visitedRows
+    envs[0].repos.remove(at: 2)
+    _ = analyzer.analyze(envs, configuration: config) // missed structural change
+    envs[1].environment.name = "Renamed"
+    world = analyzer.analyze(envs, configuration: config, changes: [:])
+    model.update(world)
+    #expect(model.visitedRows - visited == 239)
+    compare(model, world)
+    var replacement = IncrementalAnalyzer()
+    let beforeReplacement = model.visitedRows
+    world = replacement.analyze(envs, configuration: config)
+    model.update(world)
+    #expect(model.visitedRows - beforeReplacement == 239)
+    compare(model, world)
+  }
+
+  @Test func testInternalReadsAndBufferedStreamKeepAllChangesIncremental() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    var envs = inventory(), config = Configuration()
+    config.environments = envs.map(\.environment)
+    let store = StateStore(configuration: config, persistence: Persistence(directory: root),
+                           publicationDelay: .seconds(60), persistenceDelay: .seconds(60))
+    for env in envs { await store.merge(env) }
+    var stream = await store.stream().makeAsyncIterator()
+    let model = RepositoryMapModel()
+    model.update(try #require(await stream.next()))
+    let visited = model.visitedRows
+    for step in 0..<6 {
+      envs[0].repos[step].modified = step + 1
+      await store.merge(envs[0], changedPaths: [envs[0].repos[step].path])
+      _ = await store.peerMap(for: envs[1].id) // internal analysis before publication
+      if step % 2 == 1 { await store.flush() } // buffer replaces two publications
+    }
+    let world = try #require(await stream.next())
+    model.update(world)
+    #expect(model.visitedRows - visited == 18)
+    compare(model, world)
+    let actual = Dictionary(uniqueKeysWithValues: model.visibleGroups.flatMap(\.rows).map { ($0.id, $0.clone.repo) })
+    for clone in world.clones { #expect(actual[clone.id] == clone.repo) }
   }
 
   @Test func testClosingDetachesHostingTreeEvenWhenWindowRemainsRetained() {

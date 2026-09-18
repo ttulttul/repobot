@@ -28,6 +28,8 @@ struct IncrementalAnalyzer {
   private var initialized = false
   private let source = UUID()
   private var snapshotRevision: UInt64 = 0
+  private var changeHistory: [SnapshotChangeStep] = []
+  private var historyIndices = 0
   private(set) var examinedRepositories = 0
   private(set) var rebuiltCloneLists = 0
   private var deadlines: [String: Date] = [:]
@@ -42,6 +44,7 @@ struct IncrementalAnalyzer {
     // These are observation times, not evidence of changed repository state.
     a.probedAt = .distantPast; b.probedAt = .distantPast
     a.upstreamCheckedAt = nil; b.upstreamCheckedAt = nil
+    a.probeFingerprint = nil; b.probeFingerprint = nil
     return a == b
   }
   mutating func analyze(_ snapshots: [EnvironmentSnapshot], configuration config: Configuration,
@@ -151,8 +154,18 @@ struct IncrementalAnalyzer {
     }
     let previous = snapshotRevision
     snapshotRevision &+= 1
+    let indices = structural ? [] : affected.compactMap { clonePositions[$0] }.sorted()
+    if structural { changeHistory.removeAll(); historyIndices = 0 }
+    else {
+      changeHistory.append(SnapshotChangeStep(previous: previous, revision: snapshotRevision, indices: indices))
+      historyIndices += indices.count
+      // Bound both tiny-update history and large-update memory, independently of inventory size.
+      while changeHistory.count > 64 || historyIndices > 4096 {
+        historyIndices -= changeHistory.removeFirst().indices.count
+      }
+    }
     world.changes = SnapshotChanges(source: source, revision: snapshotRevision, previous: previous,
-      structural: structural, indices: structural ? [] : affected.compactMap { clonePositions[$0] }.sorted())
+      structural: structural, indices: indices, history: changeHistory)
     initialized = true
     return world
   }

@@ -60,6 +60,8 @@ public struct RepoSnapshot: Codable, Sendable, Identifiable, Equatable {
   public var branchCommitDates: [String: Date] = [:]
   public var staleLock = false, slow = false
   public var probedAt = Date()
+  public var probeFingerprint: String? = nil
+  var reusedProbeFacts: Bool? = nil
   public var changedPaths: [String] = []
   public var gitDirectories: [String] = []
   public var error: String? = nil
@@ -145,19 +147,39 @@ public struct EnvironmentSnapshot: Identifiable, Codable, Sendable {
   public var reconnecting = false
   public var checkProgress: String? = nil
   public var watcherFailure: WatcherFailure? = nil
+  public var watcherCoverageWarning: String? = nil
   public var lastCheckReason: String? = nil
   public var lastCheckStartedAt: Date? = nil
   public var lastCheckFinishedAt: Date? = nil
   public init(environment: Environment) { self.environment = environment }
 }
-/// Runtime change envelope. Consumers that miss a revision reconcile from the full
-/// snapshot, so AsyncStream buffering never silently drops repository changes.
+/// Bounded revision history lets independently buffered consumers catch up without scanning
+/// the inventory. A structural change or an expired history still requires reconciliation.
+public struct SnapshotChangeStep: Codable, Sendable {
+  public var previous: UInt64
+  public var revision: UInt64
+  public var indices: [Int]
+}
 public struct SnapshotChanges: Codable, Sendable {
   public var source: UUID
   public var revision: UInt64
   public var previous: UInt64
   public var structural: Bool
   public var indices: [Int]
+  public var history: [SnapshotChangeStep]? = nil
+
+  /// Nil means the caller must reconcile; an empty array means no repository changes.
+  public func changedIndices(since base: UInt64) -> [Int]? {
+    guard !structural, base < revision else { return nil }
+    if base == previous { return indices }
+    guard let history, let start = history.firstIndex(where: { $0.previous == base }) else { return nil }
+    var expected = base, changed = Set<Int>()
+    for step in history[start...] {
+      guard step.previous == expected else { return nil }
+      changed.formUnion(step.indices); expected = step.revision
+    }
+    return expected == revision ? changed.sorted() : nil
+  }
 }
 public struct WorldSnapshot: Codable, Sendable {
   public var environments: [EnvironmentSnapshot] = []

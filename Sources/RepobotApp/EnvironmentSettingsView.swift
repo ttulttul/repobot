@@ -42,6 +42,9 @@ struct EnvironmentSettingsView: View {
     .sheet(item: $diagnostics) { snapshot in
       PreferencesDialog(title: "Monitoring details", subtitle: snapshot.environment.name) {
         Text(snapshot.mode).font(.headline)
+        if let warning = snapshot.watcherCoverageWarning {
+          Text(warning).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+        }
         if let failure = snapshot.watcherFailure {
           Text("Last watcher failure · " + failure.occurredAt.formatted()).font(.subheadline)
           ScrollView { Text(failure.message).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }

@@ -27,6 +27,18 @@ final class InventoryCache {
     return encoder
   }()
   private(set) var encodedRepositories = 0
+  private(set) var freshnessOnlyWrites = 0
+  private func facts(_ repo: RepoSnapshot) -> RepoSnapshot {
+    var copy = repo
+    copy.probedAt = Date(timeIntervalSinceReferenceDate: 0)
+    copy.upstreamCheckedAt = nil
+    return copy
+  }
+  // Reference-date seconds preserve Foundation Date precision, including fractional seconds.
+  private func freshness(_ repo: RepoSnapshot) -> [Database.Value] {
+    [.real(repo.probedAt.timeIntervalSinceReferenceDate),
+     repo.upstreamCheckedAt.map { .real($0.timeIntervalSinceReferenceDate) } ?? .null]
+  }
   private(set) var examinedRepositories = 0
   init(directory: URL) { self.directory = directory }
   private var url: URL { directory.appendingPathComponent("inventory.sqlite") }
@@ -42,8 +54,9 @@ final class InventoryCache {
     try db.execute("BEGIN")
     defer { try? db.execute("COMMIT") }
     // A file left by an interrupted first initialization is not a committed inventory.
-    guard try db.scalar("PRAGMA user_version") == "1" else {
-      if try db.scalar("PRAGMA user_version") == "0" { return nil }
+    let version = try db.scalar("PRAGMA user_version")
+    guard version == "1" || version == "2" else {
+      if version == "0" { return nil }
       throw RepobotError.message("Unsupported inventory cache version")
     }
     guard try db.scalar("SELECT value FROM metadata WHERE key = 'complete'") == "1" else { return nil }
@@ -54,8 +67,15 @@ final class InventoryCache {
     }
     records.sort { $0.position < $1.position }
     var repositories: [String: [RepoSnapshot]] = [:]
-    try db.rows("SELECT environment, data FROM repositories ORDER BY position") { row in
-      repositories[row.string(0), default: []].append(try decoder.decode(RepoSnapshot.self, from: row.blob(1)))
+    let columns = version == "2" ? ", probed_at, upstream_checked_at" : ""
+    try db.rows("SELECT environment, data\(columns) FROM repositories ORDER BY position") { row in
+      var repo = try decoder.decode(RepoSnapshot.self, from: row.blob(1))
+      if version == "2" {
+        guard let probedAt = row.real(2) else { throw RepobotError.message("Inventory cache is missing repository freshness") }
+        repo.probedAt = Date(timeIntervalSinceReferenceDate: probedAt)
+        repo.upstreamCheckedAt = row.real(3).map { Date(timeIntervalSinceReferenceDate: $0) }
+      }
+      repositories[row.string(0), default: []].append(repo)
     }
     return records.map { record in
       var snapshot = record.snapshot
@@ -116,9 +136,9 @@ final class InventoryCache {
       databaseIdentity = fileIdentity(); openedConnections += 1
     }
     let db = database!
+    let version = schemaReady ? "2" : try db.scalar("PRAGMA user_version")
     if !schemaReady {
-      let version = try db.scalar("PRAGMA user_version")
-      guard version == "0" || version == "1" else { throw RepobotError.message("Unsupported inventory cache version") }
+      guard version == "0" || version == "1" || version == "2" else { throw RepobotError.message("Unsupported inventory cache version") }
       try db.execute("PRAGMA journal_mode=DELETE")
       try db.execute("PRAGMA synchronous=FULL")
     }
@@ -128,7 +148,13 @@ final class InventoryCache {
     if !schemaReady {
       try db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
       try db.execute("CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, data BLOB NOT NULL)")
-      try db.execute("CREATE TABLE IF NOT EXISTS repositories (environment TEXT NOT NULL, path TEXT NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(environment, path))")
+      try db.execute("CREATE TABLE IF NOT EXISTS repositories (environment TEXT NOT NULL, path TEXT NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, probed_at REAL NOT NULL, upstream_checked_at REAL, PRIMARY KEY(environment, path))")
+      if version == "1" {
+        // The first checkpoint below replaces the complete inventory in this same transaction.
+        // A failed migration rolls back both schema and data; v1 remains readable until commit.
+        try db.execute("ALTER TABLE repositories ADD COLUMN probed_at REAL")
+        try db.execute("ALTER TABLE repositories ADD COLUMN upstream_checked_at REAL")
+      }
     }
     if !initialized {
       // Replace an older process's snapshot atomically on our first checkpoint.
@@ -142,21 +168,31 @@ final class InventoryCache {
     for (id, data) in environmentChanges {
       try db.execute("INSERT INTO environments VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", [.text(id), .blob(data)])
     }
+    var encoded = 0, freshnessWrites = 0
     for (key, record) in changes {
-      let data = try encoder.encode(record.repo)
-      try db.execute("INSERT INTO repositories VALUES (?, ?, ?, ?) ON CONFLICT(environment, path) DO UPDATE SET position=excluded.position, data=excluded.data",
-                     [.text(key.environment), .text(key.path), .integer(record.position), .blob(data)])
+      let payload = facts(record.repo)
+      if let previous = savedRepos[key], facts(previous.repo) == payload {
+        // Position and observation times are small scalar updates, even when a repo is unchanged.
+        try db.execute("UPDATE repositories SET position=?, probed_at=?, upstream_checked_at=? WHERE environment=? AND path=?",
+          [.integer(record.position)] + freshness(record.repo) + [.text(key.environment), .text(key.path)])
+        freshnessWrites += 1
+      } else {
+        let data = try encoder.encode(payload)
+        try db.execute("INSERT INTO repositories (environment, path, position, data, probed_at, upstream_checked_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(environment, path) DO UPDATE SET position=excluded.position, data=excluded.data, probed_at=excluded.probed_at, upstream_checked_at=excluded.upstream_checked_at",
+          [.text(key.environment), .text(key.path), .integer(record.position), .blob(data)] + freshness(record.repo))
+        encoded += 1
+      }
     }
     if !initialized {
       try db.execute("INSERT OR REPLACE INTO metadata VALUES ('complete', '1')")
-      try db.execute("PRAGMA user_version=1")
+      try db.execute("PRAGMA user_version=2")
     }
     try db.execute("COMMIT")
     committed = true; schemaReady = true
     for key in removedRepos { savedRepos[key] = nil }
     for (key, record) in changes { savedRepos[key] = record }
     savedEnvironments = environments; initialized = true
-    encodedRepositories += changes.count
+    encodedRepositories += encoded; freshnessOnlyWrites += freshnessWrites
     return true
   }
 }
@@ -166,7 +202,7 @@ private final class Database {
   private var handle: OpaquePointer?
   private var statements: [String: OpaquePointer] = [:]
   private(set) var preparedStatements = 0
-  enum Value { case text(String), blob(Data), integer(Int) }
+  enum Value { case text(String), blob(Data), integer(Int), real(Double), null }
   init(url: URL, writable: Bool) throws {
     let flags = writable ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY
     let result = sqlite3_open_v2(url.path, &handle, flags | SQLITE_OPEN_FULLMUTEX, nil)
@@ -186,6 +222,9 @@ private final class Database {
     func string(_ column: Int32) -> String {
       guard let text = sqlite3_column_text(statement, column) else { return "" }
       return String(cString: text)
+    }
+    func real(_ column: Int32) -> Double? {
+      sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : sqlite3_column_double(statement, column)
     }
     func blob(_ column: Int32) -> Data {
       let size = Int(sqlite3_column_bytes(statement, column))
@@ -215,6 +254,8 @@ private final class Database {
       switch value {
       case .text(let text): result = sqlite3_bind_text(statement, index, text, -1, transient)
       case .integer(let integer): result = sqlite3_bind_int64(statement, index, Int64(integer))
+      case .real(let value): result = sqlite3_bind_double(statement, index, value)
+      case .null: result = sqlite3_bind_null(statement, index)
       case .blob(let data):
         result = data.withUnsafeBytes { sqlite3_bind_blob(statement, index, $0.baseAddress, Int32($0.count), transient) }
       }

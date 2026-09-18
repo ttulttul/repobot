@@ -19,8 +19,26 @@ bounded_git() {
     kill "$timer" 2>/dev/null; wait "$timer" 2>/dev/null
     return "$result"
 }
+history_fingerprint() {
+    command -v openssl >/dev/null 2>&1 || return
+    {
+        printf 'repobot-history-v2\000%s\000%s\000%s\000' "$g" "$common" "$peers"
+        printf '%s\n' "$status" | awk '/^# branch.oid / || /^# branch.head /'
+        git for-each-ref --format='%(refname) %(objectname)' 2>/dev/null || printf 'invalid:%s' "$$"
+        git config --null --list 2>/dev/null || printf 'invalid:%s' "$$"
+        for input in "$g/HEAD" "${common:-$g}/shallow" "${common:-$g}/info/grafts" "${common:-$g}/logs/refs/stash" "${common:-$g}/objects/info/alternates"; do
+            printf '\000%s\000' "$input"; cat "$input" 2>/dev/null
+        done
+        for sha in $peers; do
+            case "$sha" in (''|*[!a-fA-F0-9]*) continue;; esac
+            git cat-file -e "$sha^{commit}" 2>/dev/null; printf '%s:%s\000' "$sha" "$?"
+        done
+    } | openssl dgst -sha256 2>/dev/null | awk '{print $NF}'
+}
 while [ "$#" -ge 2 ]; do
     repo=$1; peers=$2; shift 2
+    previous_fingerprint=
+    case "$peers" in cache:*) previous_fingerprint=${peers%% *}; previous_fingerprint=${previous_fingerprint#cache:}; peers=${peers#* };; esac
     case "$repo" in '~') repo=$HOME;; '~/'*) repo=$HOME/${repo#\~/};; esac
     emit REPO "$repo"
     if ! cd "$repo" 2>/dev/null; then emit ERR 'Repository is missing' END "$repo"; continue; fi
@@ -61,6 +79,22 @@ while [ "$#" -ge 2 ]; do
     tracking_url=
     if [ -n "$remote" ] && [ "$remote" != . ]; then tracking_url=$(git remote get-url "$remote" 2>/dev/null); fi
     emit TRACKING "$tracking_url" "$merge"
+    op=none
+    [ -f "$g/BISECT_LOG" ] && op=bisect
+    [ -f "$g/REVERT_HEAD" ] && op=revert
+    [ -f "$g/CHERRY_PICK_HEAD" ] && op=cherry-pick
+    [ -f "$g/MERGE_HEAD" ] && op=merge
+    if [ -d "$g/rebase-merge" ] || [ -d "$g/rebase-apply" ]; then op=rebase; fi
+    emit OP "$op"
+    lock=0; [ -n "$(find "$g/index.lock" -mmin +10 2>/dev/null)" ] && lock=1
+    emit LOCK "$lock"
+    fingerprint=$(history_fingerprint)
+    case "$fingerprint" in ''|*[!0-9a-f]*) fingerprint=;; esac
+    [ -z "$fingerprint" ] || emit FINGERPRINT "$fingerprint"
+    if [ -n "$fingerprint" ] && [ "$fingerprint" = "$previous_fingerprint" ]; then
+        emit REUSED SLOW "$status_elapsed" END "$repo"
+        continue
+    fi
     # A complete bounded set above a common fetched tip lets two machines compare
     # unpublished commits without transferring Git objects or fetching either repo.
     if [ -n "$upsha" ]; then
@@ -70,13 +104,7 @@ while [ "$#" -ge 2 ]; do
             if [ "$count" -le 200 ]; then emit LOCALCOMMITS "$local_commits"; fi
         fi
     fi
-    op=none
-    [ -f "$g/BISECT_LOG" ] && op=bisect
-    [ -f "$g/REVERT_HEAD" ] && op=revert
-    [ -f "$g/CHERRY_PICK_HEAD" ] && op=cherry-pick
-    [ -f "$g/MERGE_HEAD" ] && op=merge
-    if [ -d "$g/rebase-merge" ] || [ -d "$g/rebase-apply" ]; then op=rebase; fi
-    emit OP "$op" STASH "$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
+    emit STASH "$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
     emit ORIGIN "$(git remote get-url origin 2>/dev/null)" ROOT "$(git rev-list --max-parents=0 HEAD 2>/dev/null | sort | head -1)"
     emit SHALLOW "$(git rev-parse --is-shallow-repository 2>/dev/null)"
     emit LAST "$(git log -1 --format=%ct 2>/dev/null)" "$(git log -1 --format=%s 2>/dev/null)"
@@ -92,12 +120,10 @@ while [ "$#" -ge 2 ]; do
         fi
         emit BRANCHWORK "$name" "$tracking" "${a:-0}" "${b:-0}"
     done
-    lock=0; [ -n "$(find "$g/index.lock" -mmin +10 2>/dev/null)" ] && lock=1
-    emit LOCK "$lock"
     if [ -z "$branch" ]; then emit DETACHED "$(git rev-list --count HEAD --not --branches 2>/dev/null)"; fi
     # Only hex object IDs are accepted. Unknown objects are not evidence of divergence.
     for sha in $peers; do
-        case "$sha" in ''|*[!a-fA-F0-9]*) continue;; esac
+        case "$sha" in (''|*[!a-fA-F0-9]*) continue;; esac
         if git cat-file -e "$sha^{commit}" 2>/dev/null; then
             if ! git merge-base HEAD "$sha" >/dev/null 2>&1; then emit PEER "$sha" unknown 0 0; continue; fi
             counts=$(git rev-list --left-right --count "HEAD...$sha" 2>/dev/null)
@@ -112,5 +138,6 @@ while [ "$#" -ge 2 ]; do
             fi
         else emit PEER "$sha" unknown 0 0; fi
     done
+    if [ -n "$fingerprint" ] && [ "$(history_fingerprint)" != "$fingerprint" ]; then emit FINGERPRINT ''; fi
     emit SLOW "$status_elapsed" END "$repo"
 done

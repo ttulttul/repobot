@@ -30,6 +30,7 @@ struct RepositoryMapMachine {
     var repo = clone.repo
     // Freshness has its own observed value; a fresh check need not redraw the whole row.
     repo.probedAt = .distantPast; repo.upstreamCheckedAt = nil
+    repo.probeFingerprint = nil
     return Content(repo: repo, status: clone.status,
                    environmentName: machine.name,
                    unavailable: machine.unavailable || repo.error != nil,
@@ -138,8 +139,11 @@ struct RepositoryMapMachine {
     progress.update(world)
     let stamp = world.changes
     if let stamp, stamp.source == snapshotSource, stamp.revision == snapshotRevision { return }
-    let incremental = initialized && stamp != nil && stamp?.source == snapshotSource
-      && stamp?.previous == snapshotRevision && stamp?.structural == false
+    let changedIndices: [Int]?
+    if initialized, let stamp, stamp.source == snapshotSource, let snapshotRevision {
+      changedIndices = stamp.changedIndices(since: snapshotRevision)
+    } else { changedIndices = nil }
+    let incremental = changedIndices != nil
     let machines = Dictionary(uniqueKeysWithValues: world.environments.map {
       ($0.id, RepositoryMapMachine(name: $0.environment.name, unavailable: $0.error != nil))
     })
@@ -147,7 +151,7 @@ struct RepositoryMapMachine {
     var structuralChange = false
     var dirty = Set<String>()
     var present = Set<String>()
-    let candidates = incremental ? stamp!.indices.map { world.clones[$0] } : Array(world.clones)
+    let candidates = changedIndices.map { $0.map { world.clones[$0] } } ?? Array(world.clones)
     visitedRows += candidates.count
     for clone in candidates {
       let id = clone.id

@@ -22,6 +22,40 @@ private actor UpstreamTransport: Transport {
   func close() async {}
 }
 struct UpstreamProbeTests {
+  @Test func testSharedQueriesStayWithinConfigurationAndFetchStillUpdatesEachCopy() async throws {
+    let helper = CoreTests(), root = try helper.temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let server = root.appendingPathComponent("server")
+    try await helper.repo(server)
+    let transport = try CountingGitTransport(root: root)
+    var paths: [String] = []
+    for index in 0..<6 {
+      let clone = root.appendingPathComponent("clone-\(index)")
+      try await helper.git(root, ["clone", server.path, clone.path]); paths.append(clone.path)
+    }
+    var repos = try await Probe.repos(paths, using: transport)
+    let before = transport.calls().count
+    let fresh = try await Probe.checkUpstreams(repos, method: .lsRemote, using: transport)
+    #expect(fresh.allSatisfy { $0.upstreamRemoteTip == repos[0].headSHA && $0.upstreamError == nil })
+    #expect(transport.calls().dropFirst(before).filter { $0.contains("ls-remote") }.count == 1)
+    #expect(Probe.upstreamBatches(repos, size: 4) == [paths])
+    // Different effective configuration gets its own observation, even with the same URL.
+    try await helper.git(URL(fileURLWithPath: paths[0]), ["config", "http.extraHeader", "X-Fixture: different-context"])
+    let differing = transport.calls().count
+    _ = try await Probe.checkUpstreams(repos, method: .lsRemote, using: transport)
+    #expect(transport.calls().dropFirst(differing).filter { $0.contains("ls-remote") }.count == 2)
+    try await helper.git(server, ["checkout", "-b", "replacement"])
+    try await helper.git(server, ["branch", "-D", "main"])
+    let deleted = try await Probe.checkUpstreams(repos, method: .lsRemote, using: transport)
+    #expect(deleted.allSatisfy { $0.upstreamRemoteDeleted })
+    try await helper.git(server, ["branch", "main"])
+    try await helper.git(server, ["checkout", "main"])
+    try Data("changed".utf8).write(to: server.appendingPathComponent("tracked"))
+    try await helper.git(server, ["commit", "-am", "Advance"])
+    repos = try await Probe.checkUpstreams(repos, method: .fetch, using: transport)
+    #expect(repos.allSatisfy { $0.behind == 1 && $0.upstreamError == nil })
+  }
+
   @Test func testNarrowCheckPreservesLocalFactsAndRecoversDeletedRemote() async throws {
     let helper = CoreTests(), transport = UpstreamTransport()
     let root = try helper.temporary()

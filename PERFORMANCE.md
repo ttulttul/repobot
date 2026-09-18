@@ -558,3 +558,300 @@ The release app was rebuilt and its strict code signature verified. Remaining
 costs include genuinely broad changes, snapshot page-directory copies, SQLite
 commit durability, and subprocess work; further optimization should be based on
 steady-state measurements after startup checks finish.
+
+## 2026-09-18: coalesced map delivery, freshness storage, and watcher path caching
+
+Sample 7 caught a full map reconciliation, repository JSON encoding/SQLite writes,
+feeding peer maps, and repeated canonical-path resolution. The main thread was
+waiting in 2,370 of 2,379 observations; blocked pipe reads and dispatch-group waits
+are not CPU consumption. The sample alone does not establish how much each target
+contributes to sustained whole-app CPU.
+
+Implemented these three targets independently, measuring the same release workload
+before changes and after each target:
+
+1. **Catch up across skipped revisions.** The analyzer retains at most 64 change
+   steps and 4,096 changed indices. Each immutable world snapshot includes that
+   bounded history. The map unions the steps after its own last revision, so internal
+   `world()`/`peerMap()` reads and `bufferingNewest(1)` publication drops do not force
+   an inventory scan. Structural changes, history expiry, new analyzer instances,
+   and snapshots without compatible history still reconcile completely. Tests cover
+   skipped internal analyses and buffered publications together, history expiry,
+   membership changes, reopening, and host metadata changes.
+2. **Separate observation times from repository payloads.** SQLite schema 2 stores
+   `probed_at` and nullable `upstream_checked_at` as scalar REAL columns, in seconds
+   since Foundation's 2001 reference date. This preserves fractional Date precision.
+   Timestamp/position-only changes update those columns without encoding or replacing
+   the JSON payload. Git facts, upstream errors, and other semantic evidence still
+   update the payload. Schema 1 remains readable; its first checkpoint upgrades the
+   schema and replaces the inventory in the same transaction. Migration failures
+   roll back the schema as well as the data. Durability settings remain unchanged;
+   timestamp updates still have SQLite transaction and page-write costs.
+3. **Cache watcher paths by their inputs.** Status and upstream-only probes reuse
+   canonical paths when repository/Git-directory inputs are unchanged. Discovery,
+   dropped/root-change events, new Git-directory inputs, and events at a cached path
+   or its ancestor invalidate the cache. A sorted path index handles ordinary file
+   events without adding another inventory scan. Tests include retargeted symlinks,
+   ancestor events, external Git directories, removals, and unchanged content probes.
+
+### Controlled measurements
+
+The benchmark uses **720 synthetic repository copies** (240 upstream groups on three
+hosts), fixed IDs/timestamps, release optimization, and temporary SQLite/filesystem
+fixtures. It never reads the user's inventory, contacts Git servers, or changes the
+live cache. Every workload has a warmup. Each stage was run in **five separate test
+processes**, with no other test cases selected. Measurements use process user+system
+CPU (`getrusage`) and wall time. Assertions verify persistence round trips and map
+inventory counts; correctness tests separately verify the incremental semantics.
+
+Machine: Apple M2 Max, macOS 26.6.2, Apple Swift 6.4. All timing values below are
+**median CPU milliseconds per operation**, not app CPU percentages.
+
+| Workload | Baseline | After fix 1 | After fix 2 | After fix 3 |
+| --- | ---: | ---: | ---: | ---: |
+| Map delivery after three analysis revisions | 1.6255 | 0.2923 | 0.2867 | 0.2911 |
+| Analysis plus that map delivery | 1.7818 | 0.4495 | 0.4407 | 0.4338 |
+| Persist four freshness-only changes | 0.5356 | 0.5398 | 0.4462 | 0.4236 |
+| Persist four real-content changes (control) | 0.5538 | 0.5217 | 0.5171 | 0.5036 |
+| Update paths for four unchanged repositories | 0.1170 | 0.1183 | 0.1197 | 0.0017 |
+
+Comparing each fix with the immediately preceding stage: map-delivery CPU fell
+**82.0%** (analysis plus delivery **74.8%**); freshness-checkpoint CPU fell **17.3%**;
+unchanged-path update CPU fell **98.6%**. Smaller shifts in unrelated workloads are
+not attributed to those changes. We did not change checkpoint frequency or upstream
+checking policy. These are component benchmarks, not proof of lower steady-state
+Activity Monitor CPU, SwiftUI rendering time, or child-process CPU.
+
+Work counters establish the removed work independently of timing noise:
+
+| Measured workload | Baseline | Optimized |
+| --- | ---: | ---: |
+| Rows visited over 300 coalesced map deliveries | 216,000 | 2,700 |
+| Repository JSON records encoded over 100 freshness checkpoints | 400 | 0 |
+| Paths resolved over 1,000 unchanged four-repository batches | 8,000 | 0 |
+
+Raw samples, CPU/wall ranges, median absolute deviations, source fingerprints,
+base Git revisions, and test-binary hashes are saved under
+[benchmarks/2026-09-18](benchmarks/2026-09-18/). Baseline and staged results are
+`baseline.json`, `fix-1.json`, `fix-2.json`, and `fix-3.json`; the final runner
+verification is `final.json`. Source fingerprints include uncommitted source/tests
+and scripts; a Git revision alone does not identify these intermediate builds.
+
+Validation: the full release suite passed **97 tests across 20 suites** (opt-in
+benchmarks are skipped in ordinary runs). The process CPU recorder was smoke-tested
+against a temporary sleeping process. No before/after live-app CPU claim is made.
+
+### Benchmark every performance change
+
+Run one baseline, then one run for each independently reviewable performance change:
+
+```sh
+./scripts/benchmark.py --label before --output .benchmark-results/before.json
+# Apply one performance change and run its relevant correctness tests.
+./scripts/benchmark.py --label after --output .benchmark-results/after.json \
+  --compare .benchmark-results/before.json
+```
+
+The runner builds the release tests once, then executes five fresh processes. It
+retains raw test/build logs, CPU and wall samples, counters, compiler identification,
+source/binary hashes, and a source archive beside each JSON result. It rejects a
+comparison with different fixture versions, inventory sizes, hardware, or OS and
+rejects a run if sources changed while it was measuring. The source archive was
+added for future reproducibility after the four staged measurements above; those
+staged JSON files have hashes but no archived source tree. `final.json` uses the
+complete runner. The result copies in this repo omit local logs/source archives; those
+remain beside the runner's original output. Logs/archives in `.benchmark-results`
+are intentionally ignored.
+
+Keep the machine, power state, toolchain and background workload consistent. Inspect
+ranges/MAD as well as medians; repeat inconclusive comparisons. Do not add flaky
+wall-clock thresholds to correctness tests. Use work counters as deterministic
+regression checks. Include a real-content control workload so a fast freshness path
+does not hide slower ordinary updates. Change `workload_version` when modifying the
+fixture or measured workload, and establish a new baseline.
+
+### Confirm the effect in the running app
+
+After rebuilding and relaunching, let startup checks complete. Keep the same
+inventory, settings, power state, and repository activity for each phase. Record at
+least **15 minutes** with the map open, then closed; repeat/reverse the order to
+reduce bias from the scheduled-check phase. Keep the open map at the same scroll
+position/filter and do not interact with it during the recording.
+
+```sh
+./scripts/measure-process.py --pid "$(pgrep -x RepobotApp)" --phase map-open \
+  --seconds 900 --output .benchmark-results/map-open.json
+# Close the map, then record the same duration.
+./scripts/measure-process.py --pid "$(pgrep -x RepobotApp)" --phase map-closed \
+  --seconds 900 --output .benchmark-results/map-closed.json
+```
+
+The recorder samples cumulative process CPU time every five seconds and divides
+CPU-time growth by actual monotonic elapsed time. It reports one core as 100%, like
+Activity Monitor, detects a vanished/restarted process, and retains partial results
+on interruption. `ps` reports CPU time at 0.01-second precision, so use long windows.
+It measures Repobot's threads, including UI and background work, but excludes Git,
+SSH, and remote processes. It does not open/close windows or restart the app. Record
+sweeps/watcher failures alongside unexpected spikes and take a stack sample during
+them; use component benchmarks to explain the cost, not to substitute for this
+whole-process measurement.
+
+
+## 2026-09-18: five further reductions in recurring work
+
+Implemented the next five targets, retaining safety sweeps and explicit refreshes:
+
+1. **Share upstream observations within one host and authentication context.**
+   Copies with the same displayed upstream are batched together. The host shares a
+   successful `ls-remote --heads` result only when the actual URL and full effective
+   Git configuration match. Custom SSH commands, custom HTTP configuration, relative
+   endpoints, and other potentially directory-dependent authentication settings
+   conservatively keep independent queries. The private invocation cache contains
+   only advertised refs; configuration/credentials pass through a digest and are
+   never saved. Failed queries are retried independently. Fetch mode still fetches
+   every copy, since each copy needs its own objects and remote-tracking refs.
+2. **Reuse unchanged history/configuration facts.** Every status check still reads
+   the working tree, HEAD, tracking status, operations and locks. A host-side digest
+   of refs, HEAD, effective config, shallow/graft/alternate metadata, stash reflog and
+   requested peer-object availability gates reuse of the expensive history facts.
+   Sorted peer inputs avoid order-only invalidation. Full probes verify the digest
+   again after collecting facts; changes during the probe prevent subsequent reuse.
+   Discovery and explicit refresh use full probes, and unavailable fingerprint tools
+   fall back to full probes. Internal cache tokens do not invalidate map content or
+   trigger semantic analysis by themselves.
+3. **Reuse watcher coverage and known Git directories.** Rediscovery restarts a
+   watcher only when coverage changes; root/mount changes explicitly reset it.
+   Remote startup receives known private/common Git directories, avoiding repeated
+   Git subprocesses. macOS roots are compacted. Linux registers Git metadata before
+   working trees, records actual registration errno and coverage counts, closes the
+   descriptor on total registration failure, and shows limited coverage in Monitoring
+   Details. Its event loop blocks until an event instead of waking every second.
+4. **Index and coalesce filesystem events.** Swift and Python route a path through
+   its ancestors instead of scanning every repository. Nested copies and external
+   Git directories retain their owners. A bounded 50 ms ingress buffer deduplicates
+   paths before crossing into the monitor actor; more than 4,096 distinct paths
+   becomes a rescan. A delivered batch schedules one debounce. Stopping a watcher
+   cancels pending delivery; the existing generation check rejects late callbacks.
+5. **Incremental attention and notifications.** A shared revision-aware tracker
+   updates severity counts and increased-severity candidates only for affected
+   clones. Progress-only snapshots do no clone work. Missed publications catch up
+   through bounded history; structural changes/history expiry/source replacement
+   reconcile fully. Existing severities survive source replacement to avoid duplicate
+   notifications. Quiet hours, disabled notifications, unverified copies and severity
+   preferences still filter delivery. The menu badge refreshes when its count changes.
+
+### Measurements for the five targets
+
+All values are median **CPU milliseconds per operation**, not Activity Monitor
+percentages. These runs used the same M2 Max/macOS/Swift host described above.
+
+| Workload | Before/reference | Final | Difference |
+| --- | ---: | ---: | ---: |
+| Read-only upstream sweep, 12 copies | 957.4324 | 994.7138 | +3.9%; no clear CPU improvement |
+| Unchanged local status sweep, 12 copies | 1,943.5926 | 1,198.6730 | −38.3% |
+| Remote Git-directory preparation, 12 copies | 96.2194 | 0.2054 | −99.8% |
+| Remote Python routing, one event among 720 copies | 0.06285 | 0.00178 | −97.2% |
+| Swift routing, one event among 720 copies | 0.16666 | 0.01121 | −93.3% |
+| Attention count and notification candidates, one changed copy among 720 | 1.06097 | 0.00325 | −99.7% |
+
+The Git fixture creates 12 actual clones and a local Git server, measures five
+sweeps per process, and repeats in **three fresh release test processes**. Setup is
+excluded; the initial full probe supplies the history-cache baseline. Measurements
+include Repobot/test-process CPU **plus waited child-process CPU**, so moving work
+into Git/shell processes does not create a false saving. Real network latency and
+remote-host CPU were not measured. Upstream queries fell from **12 to 1 per sweep**,
+although total Git subprocesses rose from **120 to 133** because eligibility checks
+have a cost. Unchanged status sweeps fell from **228 to 132 Git subprocesses**.
+
+Staged measurements are retained rather than only the best final result. After
+upstream deduplication alone, upstream CPU was 937.9952 ms (−2.0%, overlapping the
+baseline range); unchanged-status CPU was 1,783.3120 ms. After selective probes,
+unchanged-status CPU was 1,198.6698 ms (**−32.8% versus the preceding stage**). The
+final race-hardened version measured 1,198.6730 ms, range 1,172.0880–1,283.8490.
+The −38.3% overall figure includes between-run variation already present before
+selective probing; the staged figure better isolates that change.
+
+The separate Python benchmark repeats five times with real temporary Git metadata,
+without installing filesystem watches. Known-directory preparation eliminates all
+**24 setup Git calls** for 12 copies. After reuse alone it measured 0.2184 ms, and
+routing remained 0.06293 ms; after indexed routing it measured 0.00178 ms/event.
+This does not measure recursive Linux registration or remote connection startup.
+
+The Swift scheduling fixture uses **five fresh release test processes**, 10 warmup
+operations, 500 single-copy attention updates and 10,000 routed events. Reference
+and optimized operations alternate execution order within each process, with result
+equality checked outside the timed region. The routing reference performs one
+inventory scan (conservative versus the former monitor's repeated scans). Work
+counts drop from **7.2 million repository comparisons to 50,000 ancestor lookups**;
+attention visits **500 affected clones**, versus at least **360,000 clones** for
+badge counting alone in the reference, plus its notification scans/sort.
+
+Raw staged/final measurements are in
+[benchmarks/2026-09-18-five-targets](benchmarks/2026-09-18-five-targets/).
+Swift runner results include source fingerprints, test-binary hashes, CPU/wall
+ranges, MAD and per-run counters; Python results retain source hashes and raw
+samples. Local logs and source archives are retained in
+`.benchmark-results/five-targets/` (ignored). To reproduce the new workloads:
+
+```sh
+./scripts/benchmark.py --suite git --label git --repeats 3 \
+  --output .benchmark-results/git.json
+./scripts/benchmark.py --suite scheduling --label scheduling \
+  --output .benchmark-results/scheduling.json
+python3 scripts/benchmark-watchers.py --label watchers \
+  --output .benchmark-results/watchers.json
+```
+
+The existing component controls were repeated twice (five processes per run).
+Map delivery was 0.2929/0.2903 ms versus the previous 0.2869 ms, with overlapping
+ranges and the same 2,700 visited-row counter. Content persistence was
+0.5245/0.5131 ms versus 0.5060 ms. Freshness persistence was **0.4712/0.4523 ms
+versus 0.4217 ms** (+11.7%/+7.3%); ranges overlap, and both still examine 400 records
+and encode zero, but this modest slowdown is unresolved. Retain both runs and
+investigate with alternating baseline/new builds before attributing it to either
+code changes or SQLite/background-load variance. The tiny unchanged-path control
+was 0.0018 ms versus 0.0017 ms, with zero resolutions in every run.
+
+No post-relaunch whole-app CPU reduction is claimed from these component results.
+Linux failure diagnostics were tested with simulated `inotify_add_watch` failures
+on macOS; actual Linux watch registration still needs a live-host check.
+
+Validation: **109 Swift tests across 26 suites and three Python watcher tests
+passed**, including cached/full probe equivalence, ref/stash/config/peer-object
+invalidation, concurrent ref mutation, shared upstream authentication boundaries,
+watcher reuse, nested/external path routing, coalescing overflow and notification
+parity. Shell syntax and whitespace checks passed. The release app and CLI were
+rebuilt in `dist/Repobot.app`; strict deep code-signature verification passed.
+
+### Additional optimization opportunities
+
+These are remaining targets, not measured improvements already delivered:
+
+1. **Reduce Git process launch and fingerprint overhead.** The local upstream
+   fixture removes most network queries without a clear CPU reduction: extra config
+   checks offset cheap local-server queries. A combined metadata helper or batched
+   Git plumbing may help more than another Swift collection optimization. Measure
+   both full/cold probes and cached probes, including child CPU. Full probes now
+   perform two fingerprint passes for correctness; quantify that cold-path cost
+   before expanding the cache. Large histories and many branches need separate
+   fixtures from the small repositories measured here.
+2. **Make rediscovery more selective.** Unknown non-repository file events still
+   request discovery. Distinguishing directory/membership changes from unrelated
+   files could avoid broad scans during builds outside known repositories. Preserve
+   root replacement, symlink retargeting and nested-repository discovery behavior.
+3. **Incrementally adjust remote watcher coverage.** Membership changes still
+   rebuild the stream/watch tree. Known-directory reuse eliminates Git setup work,
+   but Linux recursive registration remains proportional to directory count.
+   Report new runtime registration limits as trees grow, not only startup limits;
+   then consider coverage-aware safety checks for fully watched repositories.
+4. **Bound very large upstream groups without losing deduplication.** Keeping all
+   copies of one upstream together can exceed normal batch size and delay partial
+   progress. A host-side stream/cache shared across bounded chunks would preserve
+   the request reduction while keeping cancellation and progress responsive.
+5. **Measure the residual running-app costs.** Repeat the 15-minute open/closed map
+   protocol above with the new build, recording scheduled sweeps and watcher errors.
+   The current process recorder excludes Git/SSH children and remote CPU; extend that
+   accounting before attributing total energy use. SQLite durability/page writes,
+   broad membership changes, and SwiftUI rendering remain candidates only if fresh
+   measurements identify them. Blocked pipe reads and waits are not evidence of CPU
+   consumption by themselves.

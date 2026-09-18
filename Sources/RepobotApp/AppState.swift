@@ -10,7 +10,7 @@ import UserNotifications
   var configuration: Configuration
   var world: WorldSnapshot
   var attentionCount = 0
-  @ObservationIgnored private var lastAnalysisRevision: UInt64?
+  @ObservationIgnored private var attentionTracker = AttentionTracker()
   var error: String?
   var checking = false
   var settingsTab: SettingsTab = .general
@@ -51,7 +51,8 @@ import UserNotifications
     config.validate()
     configuration = config
     world = cached
-    attentionCount = cached.clones.reduce(0) { $0 + ($1.status.severity >= .attention ? 1 : 0) }
+    _ = attentionTracker.update(cached)
+    attentionCount = attentionTracker.count
     error = failure
     store = StateStore(configuration: config, cached: cached)
   }
@@ -59,14 +60,13 @@ import UserNotifications
     streamTask = Task { [weak self, store] in
       for await value in await store.stream() {
         guard let self else { return }
-        if value.analysisRevision == nil || value.analysisRevision != self.lastAnalysisRevision {
-          self.notify(from: self.world, to: value)
-          self.attentionCount = value.clones.reduce(0) { $0 + ($1.status.severity >= .attention ? 1 : 0) }
-          self.lastAnalysisRevision = value.analysisRevision
-        }
+        let increased = self.attentionTracker.update(value)
+        self.notify(increased, in: value)
+        let badgeChanged = self.attentionCount != self.attentionTracker.count
+        if badgeChanged { self.attentionCount = self.attentionTracker.count }
         self.repositoryMapModel?.update(value)
         self.world = value
-        self.menuChanged?()
+        if badgeChanged { self.menuChanged?() }
         if let error = await store.persistenceError {
           self.error = "Could not save state: \(error)"
         }
@@ -317,9 +317,9 @@ import UserNotifications
       } catch { self.error = error.localizedDescription }
     }
   }
-  func notify(from old: WorldSnapshot, to new: WorldSnapshot) {
-    for (id, clones) in NotificationTransitions.changed(
-      from: old, to: new, configuration: configuration)
+  func notify(_ increased: [Clone], in new: WorldSnapshot) {
+    for (id, clones) in NotificationTransitions.eligible(
+      increased, in: new, configuration: configuration)
     {
       let content = UNMutableNotificationContent()
       content.title =

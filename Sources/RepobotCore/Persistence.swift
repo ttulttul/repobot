@@ -300,22 +300,23 @@ public enum NotificationTransitions {
     now: Date = Date()
   ) -> [UUID: [Clone]] {
     guard c.notifications, c.enabled else { return [:] }
+    let previous = Dictionary(uniqueKeysWithValues: old.clones.map { ($0.id, $0.status.severity) })
+    return eligible(new.attention.filter { $0.status.severity > (previous[$0.id] ?? .ok) },
+                    in: new, configuration: c, now: now)
+  }
+  public static func eligible(_ increased: [Clone], in world: WorldSnapshot,
+                              configuration c: Configuration, now: Date = Date()) -> [UUID: [Clone]] {
+    guard c.notifications, c.enabled, !increased.isEmpty else { return [:] }
     let hour = Calendar.current.component(.hour, from: now)
     if c.quietHours
       && (c.quietStart == c.quietEnd
         || (c.quietStart < c.quietEnd
-          ? hour >= c.quietStart && hour < c.quietEnd : hour >= c.quietStart || hour < c.quietEnd))
-    {
+          ? hour >= c.quietStart && hour < c.quietEnd : hour >= c.quietStart || hour < c.quietEnd)) {
       return [:]
     }
-    let previous = Dictionary(uniqueKeysWithValues: old.clones.map { ($0.id, $0.status.severity) })
-    let changes = new.attention.filter { clone in
-      guard !new.isUnverified(clone) else {
-        return false
-      }
-      return clone.status.severity > (previous[clone.id] ?? .ok)
+    return Dictionary(grouping: increased.filter { clone in
+      !world.isUnverified(clone) && clone.status.severity >= .attention
         && (clone.status.severity == .problem ? c.notifyProblem : c.notifyAttention)
-    }
-    return Dictionary(grouping: changes, by: \.environmentID)
+    }, by: \.environmentID)
   }
 }
