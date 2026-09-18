@@ -3,3 +3,6 @@
 *.xcodeproj
 xcuserdata/
 DerivedData/
+dist/
+.swiftpm/
+__pycache__/

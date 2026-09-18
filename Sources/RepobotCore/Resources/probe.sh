@@ -1,0 +1,116 @@
+#!/bin/sh
+# NUL-delimited fields: filenames, tabs and newlines cannot inject protocol records.
+export GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1 GIT_ASKPASS= SSH_ASKPASS= SSH_ASKPASS_REQUIRE=never LC_ALL=C
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+mode=$1; shift
+emit() { printf '%s\000' "$@"; }
+git() { command git -c credential.helper= -c core.askPass= -c credential.interactive=false -c core.fsmonitor=false "$@"; }
+bounded_git() {
+    command git -c credential.helper= -c core.askPass= -c credential.interactive=false -c core.fsmonitor=false -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 "$@" &
+    child=$!
+    (
+        sleep 10 & sleeper=$!
+        trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM INT HUP
+        wait "$sleeper"
+        kill -TERM "$child" 2>/dev/null
+    ) </dev/null >/dev/null 2>&1 &
+    timer=$!
+    wait "$child"; result=$?
+    kill "$timer" 2>/dev/null; wait "$timer" 2>/dev/null
+    return "$result"
+}
+while [ "$#" -ge 2 ]; do
+    repo=$1; peers=$2; shift 2
+    case "$repo" in '~') repo=$HOME;; '~/'*) repo=$HOME/${repo#\~/};; esac
+    emit REPO "$repo"
+    if ! cd "$repo" 2>/dev/null; then emit ERR 'Repository is missing' END "$repo"; continue; fi
+    g=$(git rev-parse --absolute-git-dir 2>/dev/null)
+    if [ -z "$g" ]; then emit ERR 'Not a working repository' END "$repo"; continue; fi
+    emit GITDIR "$g"
+    common=$(git rev-parse --git-common-dir 2>/dev/null)
+    if [ -n "$common" ]; then common=$(cd "$common" 2>/dev/null && pwd -P); [ "$common" != "$g" ] && emit GITDIR "$common"; fi
+    start=$(date +%s)
+    status=$(bounded_git status --porcelain=v2 --branch --untracked-files=normal 2>/dev/null)
+    if [ $? -ne 0 ]; then emit ERR 'git status failed or exceeded the 10-second limit' SLOW 11 END "$repo"; continue; fi
+    status_elapsed=$(($(date +%s)-start))
+    printf '%s\n' "$status" | awk '
+    function out(s) {printf "%s%c",s,0}
+    /^# branch.oid / {oid=$3}
+    /^# branch.head / {head=$3}
+    /^# branch.upstream / {up=$3}
+    /^# branch.ab / {a=substr($3,2); b=substr($4,2)}
+    /^1 |^2 / {if(substr($2,1,1)!=".")s++; if(substr($2,2,1)!=".")m++}
+    /^u / {c++}
+    /^\? / {u++}
+    /^[12u?] / {if(n++<20){
+        path=$0; fields=($1=="1" ? 8 : $1=="2" ? 9 : $1=="u" ? 10 : 1)
+        for(i=0;i<fields;i++)sub(/^[^ ]* /,"",path)
+        out("PATH"); out(path)
+    }}
+    END {out("HEAD");out(oid);out(head);out(head=="(detached)"?1:0);
+         out("COUNTS");out(a+0);out(b+0);out(s+0);out(m+0);out(u+0);out(c+0)}'
+    up=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)
+    upsha=$(git rev-parse --verify '@{upstream}' 2>/dev/null)
+    branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null)
+    remote=$(git config --get "branch.$branch.remote" 2>/dev/null)
+    merge=$(git config --get "branch.$branch.merge" 2>/dev/null)
+    gone=0
+    [ -n "$merge" ] && [ -z "$upsha" ] && gone=1
+    [ -z "$up" ] && [ -n "$merge" ] && up="$remote/${merge#refs/heads/}"
+    emit UPSTREAM "$up" "$upsha" "$gone"
+    tracking_url=
+    if [ -n "$remote" ] && [ "$remote" != . ]; then tracking_url=$(git remote get-url "$remote" 2>/dev/null); fi
+    emit TRACKING "$tracking_url" "$merge"
+    # A complete bounded set above a common fetched tip lets two machines compare
+    # unpublished commits without transferring Git objects or fetching either repo.
+    if [ -n "$upsha" ]; then
+        local_commits=$(git rev-list --max-count=201 HEAD --not "$upsha" 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            count=$(printf '%s\n' "$local_commits" | awk 'NF {n++} END {print n+0}')
+            if [ "$count" -le 200 ]; then emit LOCALCOMMITS "$local_commits"; fi
+        fi
+    fi
+    op=none
+    [ -f "$g/BISECT_LOG" ] && op=bisect
+    [ -f "$g/REVERT_HEAD" ] && op=revert
+    [ -f "$g/CHERRY_PICK_HEAD" ] && op=cherry-pick
+    [ -f "$g/MERGE_HEAD" ] && op=merge
+    if [ -d "$g/rebase-merge" ] || [ -d "$g/rebase-apply" ]; then op=rebase; fi
+    emit OP "$op" STASH "$(git stash list 2>/dev/null | wc -l | tr -d ' ')"
+    emit ORIGIN "$(git remote get-url origin 2>/dev/null)" ROOT "$(git rev-list --max-parents=0 HEAD 2>/dev/null | sort | head -1)"
+    emit SHALLOW "$(git rev-parse --is-shallow-repository 2>/dev/null)"
+    emit LAST "$(git log -1 --format=%ct 2>/dev/null)" "$(git log -1 --format=%s 2>/dev/null)"
+    git for-each-ref --count=200 --format='%(refname:short) %(objectname) %(committerdate:unix)' refs/heads | while read -r name sha epoch; do emit BRANCH "$name" "$sha" BRANCHDATE "$name" "$epoch"; done
+    git for-each-ref --count=200 --format='%(refname:short) %(upstream:short)' refs/heads | while read -r name tracking; do
+        a=0; b=0
+        if [ -n "$tracking" ]; then
+            counts=$(git rev-list --left-right --count "$name...$tracking" 2>/dev/null)
+            if [ $? -eq 0 ]; then
+                a=$(printf '%s' "$counts" | awk '{print $1}')
+                b=$(printf '%s' "$counts" | awk '{print $2}')
+            fi
+        fi
+        emit BRANCHWORK "$name" "$tracking" "${a:-0}" "${b:-0}"
+    done
+    lock=0; [ -n "$(find "$g/index.lock" -mmin +10 2>/dev/null)" ] && lock=1
+    emit LOCK "$lock"
+    if [ -z "$branch" ]; then emit DETACHED "$(git rev-list --count HEAD --not --branches 2>/dev/null)"; fi
+    # Only hex object IDs are accepted. Unknown objects are not evidence of divergence.
+    for sha in $peers; do
+        case "$sha" in ''|*[!a-fA-F0-9]*) continue;; esac
+        if git cat-file -e "$sha^{commit}" 2>/dev/null; then
+            if ! git merge-base HEAD "$sha" >/dev/null 2>&1; then emit PEER "$sha" unknown 0 0; continue; fi
+            counts=$(git rev-list --left-right --count "HEAD...$sha" 2>/dev/null)
+            left=$(printf '%s' "$counts" | awk '{print $1}')
+            right=$(printf '%s' "$counts" | awk '{print $2}')
+            if [ -n "$left" ] && [ -n "$right" ]; then
+                rel=diverged
+                if [ "$left" = 0 ] && [ "$right" = 0 ]; then rel=same
+                elif [ "$left" = 0 ]; then rel=behind
+                elif [ "$right" = 0 ]; then rel=ahead; fi
+                emit PEER "$sha" "$rel" "$left" "$right"
+            fi
+        else emit PEER "$sha" unknown 0 0; fi
+    done
+    emit SLOW "$status_elapsed" END "$repo"
+done

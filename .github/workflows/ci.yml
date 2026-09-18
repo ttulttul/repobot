@@ -1,0 +1,15 @@
+name: Test
+on: [push, pull_request]
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test --disable-xctest
+      - run: python3 scripts/test-remote.py
+      - run: ./scripts/build-app.sh
+  linux-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/test-remote.py

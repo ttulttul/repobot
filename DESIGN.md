@@ -45,7 +45,7 @@ Key decisions:
   user's `~/.ssh/config`, their agent, hardware keys, jump hosts, and Tailscale SSH for free, and
   it means the key-check we show the user is exactly what their terminal would do.
   Every environment keeps one multiplexed master connection
-  (`ControlMaster=auto ControlPersist=10m ControlPath=~/Library/Application Support/Repobot/cm-%C`)
+  (`ControlMaster=auto ControlPersist=10m ControlPath=~/.repobot/cm-%C`)
   so subsequent probes are ~50 ms instead of a full handshake.
 - **Scripts go over stdin, never to disk.** `ssh host sh -s < probe.sh`,
   `ssh host python3 - < watcher.py`. Nothing is written on the remote.
@@ -114,34 +114,32 @@ No secrets are stored; ssh keys stay where they are.
 
 Goal: from "Add Environment…" to a green checkmark in under two minutes, no typing beyond a username.
 
-### 3.1 Host discovery (parallel, runs while the sheet opens)
+### 3.1 Host discovery (Tailscale list on open; LAN scan on request)
 
 **Tailscale**
 
 1. Detect the CLI at `/Applications/Tailscale.app/Contents/MacOS/Tailscale`,
    `/usr/local/bin/tailscale`, or `/opt/homebrew/bin/tailscale`. (Verified present on this
    machine at the first path.) Fallback detection: any `utun` interface with a `100.64.0.0/10` address.
-2. `tailscale status --json` → `Self` + `Peer{}`; each peer has `HostName`, `DNSName`, `TailscaleIPs`,
-   `OS`, `Online`, `UserID`, `SSH_HostKeys`. Drop `Self`, drop `Online == false` (on this tailnet that's
-   28 of 55 peers skipped without a single packet).
-3. TCP-connect to port 22 on every online peer concurrently (Network.framework `NWConnection`,
-   1.5 s timeout, cap 64 in flight). Read the ssh banner line to distinguish OpenSSH from other
-   listeners.
-4. If `SSH_HostKeys` is non-empty the node accepts **Tailscale SSH**; no key needed, mark it "Tailscale
-   SSH" and skip the key check.
+2. Run `tailscale status --json` with `TAILSCALE_BE_CLI=1`, so the bundled macOS app
+   runs as a CLI even when Repobot is launched by Finder. Read `Peer{}` directly.
+3. Display online and offline peers with their names, addresses, OS, and online status;
+   sort online devices first. Preserve stable node IDs for later address resolution.
+   Do not probe SSH ports while listing. Show disconnected/login/error states clearly.
+4. Refresh this list on opening the picker and on **Refresh**. Test SSH only for the
+   selected or manually entered host. Online status is not proof of SSH access.
 
-**LAN**
+**LAN — only after clicking Scan local network**
 
-1. Bonjour browse `_ssh._tcp` and `_sftp-ssh._tcp` (every Mac with Remote Login on advertises;
-   most Linux boxes with avahi do too). Needs `NSLocalNetworkUsageDescription` + `NSBonjourServices`
-   in Info.plist; macOS will show the Local Network permission prompt once.
-2. Sweep the primary interface's subnet (cap at /22, 1024 addresses) with the same port-22 connect.
-   Reverse-resolve names via mDNS/DNS. Skip addresses already found via Tailscale.
+1. Bonjour browse `_ssh._tcp` and `_sftp-ssh._tcp`. Needs
+   `NSLocalNetworkUsageDescription` + `NSBonjourServices` in Info.plist.
+2. Sweep the primary interface's subnet (cap at /22, 1024 addresses) with port-22
+   connects and SSH banner checks. Reverse-resolve names via mDNS/DNS.
+3. Merge results without duplicating hosts already listed through Tailscale.
 
 **Manual** — a plain `user@host[:port]` field for anything else (jump hosts come from `~/.ssh/config`).
 
-Results render as one list, grouped Tailscale / LAN / Manual, with OS icon, name, IP, and "ssh ✓"
-as scans complete.
+Results render as one list, grouped Tailscale / LAN / Manual, with OS icon, name, IP, and online/offline status for Tailscale or "ssh ✓" for scanned LAN hosts.
 
 ### 3.2 Username and key check
 
@@ -307,20 +305,39 @@ tool is just nagging.
 
 ### Across clones of the same repo (the reason this app exists)
 
-Clones are grouped by identity: normalized `origin` URL (strip scheme/user/`.git`, lowercase host) with
-the root commit as a tiebreaker/fallback when there is no origin. For each pair of clones on the **same
-branch**, we ask each side about the other's tip: `git cat-file -e <otherSHA>` and
-`git merge-base --is-ancestor <otherSHA> HEAD` (both read-only, done in the probe by passing peer SHAs
-as arguments on the next round). Then:
+Clones are grouped by normalized tracked remote URL, falling back to `origin`,
+then the root commit. Scheme, credentials, default ports, trailing slashes and
+`.git` are normalized; host names are lowercased. Empty repositories without a
+remote are scoped to their environment and path. Different histories at the same
+upstream still appear together, with comparison marked unknown when unproven.
 
-| Relation | Severity | Headline (shown on the clone you're looking at) |
+Compare matching tracked upstream branches (or local branch names when no tracked
+ref is available). Peer SHAs are checked against locally available objects. When
+both heads descend from an identical cached upstream SHA, complete bounded sets of
+commits above that SHA also establish ancestry and divergence without transferring
+objects. Sets longer than 200 or shallow histories use the ordinary comparison or
+remain unknown. Inventory up to 200 local branches for commits ahead of cached
+upstreams, including branches that are not checked out.
+
+| Relation | Severity | Behavior |
 |---|---|---|
-| Same branch, tips diverged, neither has the other's commits | **problem** | "main on devbox and on this Mac have diverged — 2 commits each way, neither pushed" |
-| Other clone has commits this one doesn't (and they're unpushed) | attention | "devbox has 3 commits on main you don't have here" |
-| Other clone has uncommitted changes on the same branch | attention | "devbox has uncommitted changes on main" |
-| This clone is behind the other, and the other's commits are pushed | attention | "This Mac is 3 behind devbox (pull to catch up)" |
-| Other clone on a different branch | info | "devbox is on feature/y" |
-| Same tip everywhere, all clean | **ok** | "In sync with devbox and build-server" |
+| Confirmed divergent tips | problem | Count commits unique to each machine |
+| Peer ahead | attention | Identify the machine with missing commits |
+| Peer has commits ahead of cached upstream | attention | Identify work to review for pushing, on any branch |
+| Peer has uncommitted changes | attention | Report regardless of checked-out branch |
+| Both copies dirty | attention | Review both copies before switching machines |
+| Different branches | info | Report branch without assuming conflict |
+| Different tips with insufficient history | info | Explicitly unknown, never guessed divergence |
+| Peer stashes | info | Identify saved work on the other machine |
+| Offline or cached data | unavailable | Last known state; require a fresh check for comparisons |
+
+**Repository Map…** is a searchable window grouped by upstream, available from
+the menu and Shift-Command-M. It lists all copies, machines, branch/commit, work
+signals, check time, and peer comparisons, with a filter for shared repositories.
+Its summary identifies machines with outstanding work rather than claiming one
+machine is currently active. Commit dates are labeled as commit dates. Refresh
+rediscovers only configured environments and roots. No automatic push, pull,
+merge, or conflict resolution is performed.
 
 ### Per environment
 
@@ -415,13 +432,19 @@ Clicking a notification opens the repo detail.
 
 ### Settings window (SwiftUI)
 
-- **General:** launch at login, default poll interval, safety-sweep interval, upstream check interval
-  and method (ls-remote / fetch / off), thresholds (uncommitted hours, unpushed hours), notifications,
-  quiet hours.
-- **Environments:** list with status; per-env sheet: name, host, user, key, roots (with the folder
-  suggestions from the capability probe), detected mode + override, poll interval override, upstream
-  method override, ignored repos, "Re-test connection".
-- **Advanced:** path to `ssh`, extra ssh options, log viewer, "Reset host key trust" per environment.
+- Three compact toolbar tabs use progressive disclosure, following the native Tailscale settings
+  pattern. Main panes fit without scrolling; only variable-length collections and logs scroll.
+- **Environments:** machine list and selected-machine summary with connection, check progress,
+  repository count, Edit, Check Now, and Terminal. Edit opens a sheet; folders, SSH connection,
+  and monitoring overrides each have their own focused sheet. Adding a machine is a three-step
+  sheet: choose device, connect, choose repository folders.
+- **Coding Agents:** account list and selected-profile summary with harness, login status, and model.
+  Profile editing is a sheet; custom account directories and executable overrides live one level deeper.
+- **Settings:** monitoring and launch-at-login toggles, with summary rows and Manage buttons for
+  checks, notifications, findings, ignored/snoozed repositories, SSH defaults, and diagnostics.
+  Each opens a focused sheet with Cancel and Done. Draft edits apply only when accepted.
+- Repository checks publish in batches before upstream checks. Cached copies awaiting a fresh check
+  are unverified, not offline; only actual connection/probe failures are labelled unavailable.
 
 ---
 
@@ -455,7 +478,7 @@ Clicking a notification opens the repo detail.
 2. **SSH environments.** `SSHTransport` with ControlMaster, Add Environment (manual host) with the
    BatchMode key check and capability probe, BFS repo discovery, client-side polling mode, root-folder
    suggestions. CLI harness `repobot probe user@host` for debugging without the UI.
-3. **Discovery.** Tailscale (`status --json`) and LAN (Bonjour + subnet sweep) with parallel port-22
+3. **Discovery.** Tailscale device listing (`status --json`) without probing, and optional LAN (Bonjour + subnet sweep) port-22
    checks, Local Network permission plumbing, Tailscale SSH detection.
 4. **Event-driven remotes.** python3+ctypes inotify watcher, `inotifywait`/`fswatch` tiers, heartbeat,
    reconnect/backoff, safety sweep, sleep/wake handling.
@@ -556,3 +579,51 @@ while True:
 
 The Swift side launches this with `ssh host python3 - repo1 repo2 … < watcher.py`, reads stdout line
 by line, debounces `CHANGED` lines, and re-probes only those repos.
+
+
+## Coding-agent reconciliation
+
+The Repository Map and repository detail windows offer **Ask an agent…**. The
+workflow separates analysis from user-selected execution:
+
+- Profiles: detected Codex/Claude CLI paths, named account home, optional model ID.
+  Status comes from each harness's login command, not credential file inspection.
+  Separate homes use CODEX_HOME or CLAUDE_CONFIG_DIR. Login repair opens Terminal.
+  Blank model omits the model flag and preserves the harness default.
+- Context: refreshed deterministic snapshots, machine identifiers, repository paths,
+  peer findings, freshness errors, and a content/ref fingerprint for each copy.
+- Analysis: structured summary/problems/options, with evidence, steps, risks,
+  destructive markers and exact affected clone IDs. Options are agent-authored,
+  not limited to a fixed Git-action catalog. Agents inspect scoped local/SSH
+  copies through a stdio MCP helper with fixed read-only Git/file operations.
+- Live activity: parse Codex JSONL events and Claude stream-json partial messages
+  into bounded, persisted public messages and inspection summaries. Ignore private
+  reasoning, authentication metadata and raw inspection payloads. Agent stdout goes
+  to an owner-private temporary regular file which the app tails, avoiding broken
+  output pipes. Drain the last events after process exit, then remove the raw file
+  on success, failure or cancellation. The dialog can
+  follow the latest output, copy it, or collapse completed analysis activity.
+- Review: all problems default to unchanged. The user chooses at most one option
+  per problem. Invalid IDs, duplicate IDs and out-of-context targets are rejected.
+- Execution: revalidate fingerprints, then hand the exact selections, analysis,
+  and connection context to the same profile/model in an interactive Terminal
+  harness. No automatic permission bypass. Instructions require preflight,
+  recoverable backups before destructive actions, tests, and a concrete report.
+  A flushing pseudo-terminal transcript mirrors output into the dialog without
+  keystroke recording. ANSI controls are rendered as bounded text; prompts still
+  require interaction in Terminal. Capture session exit status separately from
+  repository verification, and keep verification disabled while execution runs.
+- Verification: explicitly refresh every copy after the user reports completion.
+  Show current deterministic findings without claiming semantic success.
+- Persistence: owner-private review artifacts and profile configuration, with no
+  saved credentials. Interrupted analysis is recoverable; execution is never
+  automatically replayed after restart.
+
+### Inventory publication and persistence
+
+Progress metadata updates reuse analyzed repository results. Inventory changes
+coalesce over 250 ms before UI publication; the private atomic state cache uses
+compact JSON and a five-second checkpoint deadline that does not reset under
+continuous updates. Sweep completion, configuration changes, and monitor shutdown
+flush pending results. Failed saves retain dirty state for retry. See
+[PERFORMANCE.md](PERFORMANCE.md) for measurements and follow-up work.

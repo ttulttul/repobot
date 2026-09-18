@@ -57,5 +57,7 @@ iconutil -c icns assets/icons/AppIcon.iconset -o assets/icons/AppIcon.icns
 
 The naming and packaging follow Apple's documented
 [high-resolution icon workflow](https://developer.apple.com/library/archive/documentation/GraphicsAnimation/Conceptual/HighResolutionOSX/Optimizing/Optimizing.html).
-There is no app target in this checkout yet; these assets are ready to add to its
-resources when it is created.
+The app bundle uses `AppIcon.icns` through `CFBundleIconFile`. The release build
+compiles the supplied iconset; the Xcode project includes the checked-in ICNS.
+`MenuBarGlyph.svg` is loaded at 22 points as an AppKit template image so macOS
+adapts it to light, dark, selected and disabled menu-bar appearances.

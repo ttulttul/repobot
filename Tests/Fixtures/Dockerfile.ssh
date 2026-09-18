@@ -1,0 +1,9 @@
+FROM mcr.microsoft.com/playwright:v1.62.1-noble
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-server && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd /root/.ssh /repos/demo \
+    && git -C /repos/demo init -b main \
+    && git -C /repos/demo config user.name Fixture \
+    && git -C /repos/demo config user.email fixture@example.invalid \
+    && echo initial > /repos/demo/tracked \
+    && git -C /repos/demo add . && git -C /repos/demo commit -m Initial
+CMD ["/usr/sbin/sshd", "-D", "-e", "-o", "PasswordAuthentication=no", "-o", "PermitRootLogin=prohibit-password", "-o", "StrictModes=no"]
