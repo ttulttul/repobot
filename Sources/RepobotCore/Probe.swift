@@ -18,6 +18,7 @@ public enum Probe {
       case "INOTIFY": c.inotifywait = true
       case "FSWATCH": c.fswatch = true
       case "MAX": c.maxWatches = Int(value) ?? 8192
+      case "CPUS": c.cpus = Int(value)
       case "ROOT": c.suggestedRoots.append(value)
       default: break
       }
@@ -103,6 +104,13 @@ public enum Probe {
     }
     if !batch.isEmpty { batches.append(batch) }
     return batches
+  }
+  /// Upstream checks wait on the network, so they run concurrently, one per core of the
+  /// machine that runs them. The ceilings are not about CPU: many simultaneous connections
+  /// to one Git host invite throttling, and a remote's checks share one multiplexed SSH
+  /// connection whose sshd allows ten sessions (MaxSessions), some already in use.
+  public static func upstreamConcurrency(cpus: Int?, remote: Bool) -> Int {
+    min(max(1, cpus ?? 4), remote ? 6 : 8)  // Unknown for environments saved before CPUS was reported.
   }
   /// Refresh only server evidence. Local status remains valid until a watcher or sweep refreshes it.
   public static func checkUpstreams(

@@ -430,6 +430,40 @@ struct CoreTests {
     #expect(world.environments.first?.mode.contains("FSEvents") == true)
     await monitor.stop()
   }
+  @Test func testUpstreamBatchesRunConcurrently() async throws {
+    #expect(Probe.upstreamConcurrency(cpus: 12, remote: false) == 8)
+    #expect(Probe.upstreamConcurrency(cpus: 4, remote: false) == 4)
+    #expect(Probe.upstreamConcurrency(cpus: 32, remote: true) == 6)
+    #expect(Probe.upstreamConcurrency(cpus: nil, remote: true) == 4)
+    let root = try temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    for index in 0..<12 {
+      let bare = root.appendingPathComponent("upstream-\(index).git"), clone = root.appendingPathComponent("repos/clone-\(index)")
+      try await repo(clone)
+      try await git(root, ["init", "-q", "--bare", bare.path])
+      try await git(clone, ["remote", "add", "origin", bare.path])
+      try await git(clone, ["push", "-q", "-u", "origin", "HEAD"])
+    }
+    var env = Environment.local
+    env.roots = [root.appendingPathComponent("repos").path]
+    env.watchMode = .poll
+    var c = Configuration()
+    c.environments = [env]
+    c.upstreamCheck = .lsRemote
+    let store = StateStore(configuration: c, persistence: Persistence(directory: root.appendingPathComponent("cache")))
+    let transport = CountingTransport()
+    let monitor = EnvironmentMonitor(environment: env, configuration: c, store: store, transport: transport)
+    await monitor.start()
+    var world = await store.world()
+    for _ in 0..<200 where world.clones.count < 12 || world.clones.contains(where: { $0.repo.upstreamCheckedAt == nil }) {
+      try await Task.sleep(for: .milliseconds(100))
+      world = await store.world()
+    }
+    await monitor.stop()
+    #expect(world.clones.count == 12 && world.clones.allSatisfy { $0.repo.upstreamRemoteTip == $0.repo.headSHA && $0.repo.upstreamError == nil })
+    // Twelve independent upstreams form three batches of four, all in flight together.
+    #expect(transport.counter.peak == min(3, Probe.upstreamConcurrency(cpus: ProcessInfo.processInfo.activeProcessorCount, remote: false)))
+  }
   @Test func testWatchEconomySettingsAndGitignoreFixPrompt() throws {
     // Configurations saved before these settings existed must still load.
     var legacy = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(Configuration())) as? [String: Any])
@@ -477,17 +511,16 @@ struct CoreTests {
     #expect(WatcherCost.memory(1_288_490_189) == "1.2GB")
     #expect(WatcherCost.memory(300_000) == "293KB")
     let first = try #require(WatcherCostSampler.parse(
-      "processes=1\nticks=100\nhz=100\nrss=67108864\nuptime=50.00\nkind=inotify\nhandles=14000\nlimit=524288\n", previous: nil))
+      "processes=1\nticks=100\nhz=100\nrss=67108864\nuptime=50.00\nhandles=14000\nlimit=524288\n", previous: nil))
     #expect(first.0.cpuText == "—" && first.0.memoryText == "64MB")
     #expect(first.0.handlesText == "14K of 524K inotify watches")
     let second = try #require(WatcherCostSampler.parse(
-      "processes=1\nticks=106\nhz=100\nrss=67108864\nuptime=52.00\nkind=inotify\nhandles=14000\nlimit=524288\n", previous: first.1))
+      "processes=1\nticks=106\nhz=100\nrss=67108864\nuptime=52.00\nhandles=14000\nlimit=524288\n", previous: first.1))
     #expect(second.0.cpuText == "3%")
-    let mac = try #require(WatcherCostSampler.parse("processes=2\ncpu=0.2\nrss=1048576\nkind=files\nhandles=21\nlimit=256\n", previous: nil))
-    #expect(mac.0.cpuText == "<1%" && mac.0.handlesText == "21 of 256 open files")
-    #expect(WatcherCostSampler.parse("processes=0\nkind=inotify\n", previous: nil) == nil)
-    let local = WatcherCostSampler.local(previous: nil).0
-    #expect(local.inProcess && (local.handles ?? 0) > 0 && (local.memoryBytes ?? 0) > 0)
+    #expect(WatcherCost(handles: 1, handleLimit: 10, cpuPercent: 0.2, memoryBytes: 1, processes: 1).cpuText == "<1%")
+    // A Mac prints nothing (FSEvents is not measured); a vanished watcher has no processes.
+    #expect(WatcherCostSampler.parse("", previous: nil) == nil)
+    #expect(WatcherCostSampler.parse("processes=0\n", previous: nil) == nil)
   }
   @Test func testPythonMacWatcherOverStdin() async throws {
     let root = try temporary()
@@ -587,7 +620,7 @@ struct CoreTests {
     let usage = try #require(await events.usage)
     #expect(usage.total > 0 && usage.limit > usage.total && usage.repos.first?.path == paths[0])
     let (cost, reading) = try #require(try await WatcherCostSampler.remote(group: group, transport: transport, previous: nil))
-    #expect(cost.handleKind == .inotify && cost.processes == 1)
+    #expect(cost.processes == 1)
     #expect((cost.handles ?? 0) > 0 && (cost.handleLimit ?? 0) > (cost.handles ?? 0))
     #expect((cost.memoryBytes ?? 0) > 1_000_000 && cost.cpuPercent == nil && reading != nil)
     let edit = try await transport.run(
@@ -686,4 +719,28 @@ private actor EventRecorder {
     default: break
     }
   }
+}
+
+/// Records how many upstream checks overlap; each is held open long enough to be observed.
+private struct CountingTransport: Transport {
+  final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = 0
+    private(set) var peak = 0
+    func enter() { lock.withLock { current += 1; peak = max(peak, current) } }
+    func leave() { lock.withLock { current -= 1 } }
+  }
+  let counter = Counter()
+  let local = LocalTransport()
+  func run(script: String, arguments: [String], timeout: Double) async throws -> CommandResult {
+    guard arguments.first == UpstreamCheck.lsRemote.rawValue else {
+      return try await local.run(script: script, arguments: arguments, timeout: timeout)
+    }
+    counter.enter()
+    defer { counter.leave() }
+    try await Task.sleep(for: .milliseconds(300))
+    return try await local.run(script: script, arguments: arguments, timeout: timeout)
+  }
+  func invocation(program: String, arguments: [String]) -> (String, [String]) { local.invocation(program: program, arguments: arguments) }
+  func close() async {}
 }

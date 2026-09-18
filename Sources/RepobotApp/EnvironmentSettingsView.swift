@@ -92,7 +92,7 @@ struct EnvironmentSettingsView: View {
           Button(snapshot?.reconnecting == true ? "Watcher issue…" : "Details…") { diagnostics = snapshot }
             .disabled(snapshot == nil)
         }
-        PreferenceRow(title: "Watcher cost") { WatcherCostView(state: state, environment: env.id) }
+        if env.kind == .ssh { WatcherCostView(state: state, environment: env.id) }
         if let usage = snapshot?.watchUsage { watchUsage(usage, in: env) }
         PreferenceRow(title: "Repositories") { Text("\(snapshot?.repos.count ?? 0) in \(env.roots.count) root folders") }
         PreferenceRow(title: "Last check") {
@@ -160,10 +160,9 @@ private struct WatcherCostView: View {
   let state: AppState
   let environment: UUID
   @State private var cost: WatcherCost?
-  @State private var sampled = false
   var body: some View {
-    VStack(alignment: .leading, spacing: 5) {
-      if let cost {
+    // Absent for Macs and while no Linux watcher is running.
+    Group { if let cost { PreferenceRow(title: "Watcher cost") { VStack(alignment: .leading, spacing: 5) {
         HStack(spacing: 14) {
           Label(cost.cpuText + " CPU", systemImage: "cpu")
           Label(cost.memoryText + " RAM", systemImage: "memorychip")
@@ -173,19 +172,14 @@ private struct WatcherCostView: View {
           ProgressView(value: fraction).tint(fraction > 0.8 ? .orange : .accentColor).frame(maxWidth: 220)
             .accessibilityLabel("Share of the limit in use")
         }
-        Text(cost.inProcess ? "Measured for Repobot itself; the local watcher runs inside the app."
-          : cost.processes == 1 ? "One watcher process on this machine." : "\(cost.processes) watcher processes on this machine.")
+        Text(cost.processes == 1 ? "One watcher process on this machine." : "\(cost.processes) watcher processes on this machine.")
           .font(.caption).foregroundStyle(.secondary)
-      } else {
-        Text(sampled ? "No watcher process is running" : "Measuring…").foregroundStyle(.secondary)
-      }
-    }
+    } } } }
     .monospacedDigit()
     .task(id: environment) {
-      cost = nil; sampled = false
+      cost = nil
       while !Task.isCancelled {
         cost = await state.monitors[environment]?.watcherCost()
-        sampled = true
         try? await Task.sleep(for: .seconds(2))
       }
     }

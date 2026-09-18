@@ -281,12 +281,18 @@ Details for the event tiers:
   chosen coding agent interactively in Terminal (in the repository, or with SSH details for a
   remote) with that evidence. The agent may only propose `.gitignore` edits and must show the diff
   before writing. A changed `.gitignore` emits `RESET`, so coverage is recomputed at once.
-- **Watcher cost.** Each watcher announces its process group (`GROUP`). While the Environments
-  settings page is visible — and only then — the app samples that group every 2 s over the
-  multiplexed connection (`cost.sh`, stdin-only like every other script) and shows CPU ("3%"), RAM
-  ("64MB") and the watch mechanism's handles against its limit ("14K of 524K inotify watches" on
-  Linux; open files against the descriptor limit on macOS). The local FSEvents watcher runs
-  in-process, so its figures are Repobot's own.
+- **Watcher cost.** Linux only: FSEvents watches whole hierarchies with no per-directory cost, so
+  Macs (local or remote) are not measured. Each watcher announces its process group (`GROUP`).
+  While the Environments settings page is visible — and only then — the app samples that group
+  every 2 s over the multiplexed connection (`cost.sh`, stdin-only like every other script) and
+  shows CPU ("3%"), RAM ("64MB") and inotify watches against the per-user limit ("14K of 524K").
+- **Concurrent upstream checks.** `ls-remote`/`fetch` wait on the network, so batches (four
+  repositories; all copies of one upstream stay in one batch and share its private query cache)
+  run concurrently: one per core of the machine doing the work (`CPUS` capability for remotes),
+  capped at 8 locally and 6 over SSH. The caps are about connections, not CPU: bursts against one
+  Git host get throttled, and a remote's checks share a multiplexed connection limited by sshd's
+  `MaxSessions` (10), which the watcher and cost sampler also use. Results merge as each batch
+  completes.
 - **Safety sweep.** Even in event mode a full probe runs every 5 min (configurable) to catch anything
   the watcher missed and to run the upstream check.
 - **Debounce.** Events are coalesced per repo for 2 s (an editor save or `git commit` produces dozens

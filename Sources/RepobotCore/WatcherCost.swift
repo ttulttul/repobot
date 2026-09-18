@@ -1,24 +1,18 @@
-import Darwin
 import Foundation
 
-/// What event monitoring of one environment costs the machine that runs the watcher.
+/// What event monitoring costs a Linux machine. inotify spends one watch per directory from a
+/// limited per-user budget; FSEvents on macOS has no comparable cost, so Macs are not measured.
 public struct WatcherCost: Sendable, Equatable {
-  public enum HandleKind: String, Sendable { case inotify, files }
-  /// Units of whatever the watch mechanism consumes: inotify watches out of the
-  /// per-user limit on Linux, open files out of the descriptor limit elsewhere.
-  public var handleKind: HandleKind
+  /// inotify watches held, out of fs.inotify.max_user_watches.
   public var handles: Int?, handleLimit: Int?
   /// Percentage of one core. Nil until a rate can be derived from two samples.
   public var cpuPercent: Double?
   public var memoryBytes: Int64?
   public var processes: Int
-  /// The local FSEvents watcher runs inside Repobot, so its cost is the app's own.
-  public var inProcess = false
 
   public var handlesText: String {
     guard let handles else { return "—" }
-    let unit = handleKind == .inotify ? "inotify watches" : "open files"
-    return Self.count(handles) + (handleLimit.map { " of " + Self.count($0) } ?? "") + " " + unit
+    return Self.count(handles) + (handleLimit.map { " of " + Self.count($0) } ?? "") + " inotify watches"
   }
   public var cpuText: String {
     guard let cpuPercent else { return "—" }
@@ -69,42 +63,17 @@ public enum WatcherCostSampler {
       let pair = line.split(separator: "=", maxSplits: 1)
       if pair.count == 2 { fields[String(pair[0])] = String(pair[1]) }
     }
-    guard let processes = fields["processes"].flatMap(Int.init), processes > 0,
-          let kind = fields["kind"].flatMap(WatcherCost.HandleKind.init) else { return nil }
+    guard let processes = fields["processes"].flatMap(Int.init), processes > 0 else { return nil }
     var reading: WatcherCPUReading?
     if let ticks = fields["ticks"].flatMap(Double.init), let hz = fields["hz"].flatMap(Double.init), hz > 0,
        let uptime = fields["uptime"].flatMap(Double.init) {
       reading = WatcherCPUReading(seconds: ticks / hz, at: uptime)
     }
     let cost = WatcherCost(
-      handleKind: kind, handles: fields["handles"].flatMap(Int.init),
+      handles: fields["handles"].flatMap(Int.init),
       handleLimit: fields["limit"].flatMap(Int.init),
-      cpuPercent: fields["cpu"].flatMap(Double.init) ?? reading?.percent(since: previous),
+      cpuPercent: reading?.percent(since: previous),
       memoryBytes: fields["rss"].flatMap(Int64.init), processes: processes)
-    return (cost, reading)
-  }
-  /// The local watcher is an in-process FSEvents stream: report this process.
-  public static func local(previous: WatcherCPUReading?) -> (WatcherCost, WatcherCPUReading) {
-    var usage = rusage()
-    getrusage(RUSAGE_SELF, &usage)
-    let seconds = Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec)
-      + Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1_000_000
-    let reading = WatcherCPUReading(seconds: seconds, at: ProcessInfo.processInfo.systemUptime)
-    var info = task_vm_info_data_t()
-    var size = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
-    let status = withUnsafeMutablePointer(to: &info) {
-      $0.withMemoryRebound(to: integer_t.self, capacity: Int(size)) {
-        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &size)
-      }
-    }
-    var limit = rlimit()
-    getrlimit(RLIMIT_NOFILE, &limit)
-    let open = (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count).map { max(0, $0 - 1) }
-    let cost = WatcherCost(
-      handleKind: .files, handles: open,
-      handleLimit: limit.rlim_cur > UInt64(Int32.max) ? nil : Int(limit.rlim_cur),
-      cpuPercent: reading.percent(since: previous),
-      memoryBytes: status == KERN_SUCCESS ? Int64(info.phys_footprint) : nil, processes: 1, inProcess: true)
     return (cost, reading)
   }
 }

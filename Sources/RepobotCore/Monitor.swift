@@ -283,27 +283,56 @@ public actor EnvironmentMonitor {
     let batches = upstream == .off
       ? stride(from: 0, to: paths.count, by: batchSize).map { Array(paths[$0..<min($0 + batchSize, paths.count)]) }
       : Probe.upstreamBatches(paths.compactMap { repoPositions[$0].map { snapshot.repos[$0] } }, size: batchSize)
-    var start = 0
-    for batch in batches {
-      defer { start += batch.count }
-      try Task.checkCancellation()
-      guard !stopped else { throw CancellationError() }
-      snapshot.checkProgress = upstream == .off
-        ? "Checking repositories: \(start) of \(paths.count)"
-        : "Checking upstreams: \(start) of \(paths.count) · repository status available"
-      await store.updateProgress(snapshot.checkProgress, for: environment.id)
-      let repos: [RepoSnapshot]
-      if upstream == .off {
+    guard upstream != .off else {
+      var start = 0
+      for batch in batches {
+        defer { start += batch.count }
+        try Task.checkCancellation()
+        guard !stopped else { throw CancellationError() }
+        snapshot.checkProgress = "Checking repositories: \(start) of \(paths.count)"
+        await store.updateProgress(snapshot.checkProgress, for: environment.id)
         let previous: [String: RepoSnapshot] = reuseFacts ? Dictionary(uniqueKeysWithValues: batch.compactMap { path in
           repoPositions[path].map { (path, snapshot.repos[$0]) }
         }) : [:]
-        repos = try await Probe.repos(batch, peerMap: peerMap, previous: previous, using: transport)
-      } else {
-        repos = try await Probe.checkUpstreams(batch.compactMap { path in
-          repoPositions[path].map { snapshot.repos[$0] }
-        }, peerMap: peerMap,
-                                              method: upstream, using: transport)
+        try await merge(Probe.repos(batch, peerMap: peerMap, previous: previous, using: transport), batch: batch)
       }
+      return
+    }
+    // Network-bound: keep several batches in flight and merge each as it completes. A batch
+    // holds every copy of one upstream, so its private query cache needs no coordination.
+    let width = Probe.upstreamConcurrency(
+      cpus: environment.kind == .local ? ProcessInfo.processInfo.activeProcessorCount : capabilities?.cpus,
+      remote: environment.kind == .ssh)
+    let transport = transport
+    var pending = batches.makeIterator(), done = 0
+    try await withThrowingTaskGroup(of: ([String], [RepoSnapshot]).self) { group in
+      // Capture status at launch, not up front: events may refresh it meanwhile.
+      for _ in 0..<width {
+        guard let batch = pending.next() else { break }
+        let repos = upstreamInputs(batch)
+        group.addTask { (batch, try await Probe.checkUpstreams(repos, peerMap: peerMap, method: upstream, using: transport)) }
+      }
+      snapshot.checkProgress = "Checking upstreams: 0 of \(paths.count) · repository status available"
+      await store.updateProgress(snapshot.checkProgress, for: environment.id)
+      while let (batch, repos) = try await group.next() {
+        try Task.checkCancellation()
+        guard !stopped else { throw CancellationError() }
+        try await merge(repos, batch: batch)
+        done += batch.count
+        snapshot.checkProgress = "Checking upstreams: \(done) of \(paths.count) · repository status available"
+        await store.updateProgress(snapshot.checkProgress, for: environment.id)
+        if let batch = pending.next() {
+          let repos = upstreamInputs(batch)
+          group.addTask { (batch, try await Probe.checkUpstreams(repos, peerMap: peerMap, method: upstream, using: transport)) }
+        }
+      }
+    }
+  }
+  private func upstreamInputs(_ batch: [String]) -> [RepoSnapshot] {
+    batch.compactMap { path in repoPositions[path].map { snapshot.repos[$0] } }
+  }
+  private func merge(_ repos: [RepoSnapshot], batch: [String]) async throws {
+    do {  // Scope retained from the batch loop body.
       try Task.checkCancellation()
       guard !stopped else { throw CancellationError() }
       for repo in repos {
@@ -441,14 +470,10 @@ public actor EnvironmentMonitor {
       } catch {}
     }
   }
-  /// Sampled on demand while the environment settings are visible; nil without a watcher.
+  /// Sampled on demand while the environment settings are visible. Linux only: nil for
+  /// FSEvents watchers, which have no per-directory cost, and when no watcher is running.
   public func watcherCost() async -> WatcherCost? {
-    if localWatcher != nil {
-      let (cost, reading) = WatcherCostSampler.local(previous: watcherCPU)
-      watcherCPU = reading
-      return cost
-    }
-    guard remoteWatcher != nil, let group = watcherGroup else { return nil }
+    guard remoteWatcher != nil, capabilities?.os == "Linux", let group = watcherGroup else { return nil }
     let generation = watcherGeneration
     guard let (cost, reading) = try? await WatcherCostSampler.remote(
       group: group, transport: transport, previous: watcherCPU), generation == watcherGeneration

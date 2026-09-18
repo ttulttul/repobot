@@ -1,9 +1,8 @@
 #!/bin/sh
-# Resource cost of one watcher process group ($1). Prints key=value lines. Linux reports
-# cumulative CPU ticks (the client derives a rate between samples); macOS reports ps's
-# recent CPU percentage. "handles" is whatever the watch mechanism consumes: inotify
-# watches out of the per-user limit on Linux, open files out of the descriptor limit
-# elsewhere.
+# Resource cost of one Linux watcher process group ($1), as key=value lines: cumulative
+# CPU ticks (the client derives a rate between samples), resident memory, and inotify
+# watches against the per-user limit. FSEvents on macOS has no per-directory cost, so
+# nothing is reported there.
 group=$1
 if [ -r /proc/self/stat ]; then
     hz=$(getconf CLK_TCK 2>/dev/null); page=$(getconf PAGESIZE 2>/dev/null)
@@ -20,15 +19,6 @@ if [ -r /proc/self/stat ]; then
         count=$(cat /proc/"$pid"/fdinfo/* 2>/dev/null | grep -c '^inotify')
         handles=$((handles + count))
     done
-    echo "kind=inotify"; echo "handles=$handles"
+    echo "handles=$handles"
     echo "limit=$(cat /proc/sys/fs/inotify/max_user_watches 2>/dev/null)"
-else
-    members=$(ps -A -o pgid=,pid=,pcpu=,rss= | awk -v group="$group" '
-        $1 == group { cpu += $3; rss += $4; pids = pids (n++ ? "," : "") $2 }
-        END { printf "processes=%d\ncpu=%.1f\nrss=%.0f\npids=%s\n", n, cpu, rss * 1024, pids }')
-    printf '%s\n' "$members" | grep -v '^pids='
-    pids=$(printf '%s\n' "$members" | sed -n 's/^pids=//p')
-    echo "kind=files"
-    [ -n "$pids" ] && echo "handles=$(lsof -n -P -p "$pids" 2>/dev/null | awk 'NR > 1 && $4 ~ /^[0-9]/' | wc -l | tr -d ' ')"
-    echo "limit=$(ulimit -n)"
 fi

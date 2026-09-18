@@ -15,6 +15,8 @@ public struct Capabilities: Codable, Sendable {
   public var os = "", architecture = "", gitVersion = "", home = ""
   public var python = false, inotifywait = false, fswatch = false
   public var maxWatches = 8192
+  /// Optional so capabilities saved before this existed still load.
+  public var cpus: Int? = nil
   public var suggestedRoots: [String] = []
   public init() {}
 }
