@@ -45,6 +45,7 @@ struct IncrementalAnalyzer {
     a.probedAt = .distantPast; b.probedAt = .distantPast
     a.upstreamCheckedAt = nil; b.upstreamCheckedAt = nil
     a.probeFingerprint = nil; b.probeFingerprint = nil
+    a.age = nil; b.age = nil // Age observations have their own UI invalidation boundary.
     return a == b
   }
   mutating func analyze(_ snapshots: [EnvironmentSnapshot], configuration config: Configuration,

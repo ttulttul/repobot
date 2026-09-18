@@ -59,6 +59,7 @@ public struct RepoSnapshot: Codable, Sendable, Identifiable, Equatable {
   public var localBranches: [String: String] = [:]
   public var branchCommitDates: [String: Date] = [:]
   public var staleLock = false, slow = false
+  public var age: RepositoryAge? = nil
   public var probedAt = Date()
   public var probeFingerprint: String? = nil
   var reusedProbeFacts: Bool? = nil

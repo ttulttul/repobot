@@ -76,6 +76,23 @@ that may need pushing, including other local branches. **Details…** opens its
 findings and Terminal actions. **Refresh all** rediscovers configured roots and
 checks every configured machine; it does not connect to unconfigured Tailscale peers.
 
+Copy rows show **Last commit** and **Newest file** ages without expanding details.
+Both ages are measured at the last repository check using that machine's own
+system clock. Last commit refers to the checked-out HEAD's commit date.
+Newest file is the most recent modification time among regular
+working-tree files, including ignored files. Git directories (including custom
+and shared worktree metadata), `.git` marker files, `.DS_Store`, and AppleDouble
+`._*` files are excluded. Symlinks are not followed. A checkout, build, or copied
+file can have a recent modification time; these ages are clues for reviewing old
+work, not proof of the last human edit or that work is safe to discard.
+
+Clock checks allow for transport delay and timestamp precision. The map warns
+when a machine's clock demonstrably differs from this Mac, or another machine's
+last measured clock, by more than five seconds. Slow connections or clock changes
+during a check produce an inconclusive/unavailable comparison instead of a false
+skew warning. Expand the monitoring warning or a copy for more detail. Older
+cached repositories show ages as unavailable until their next check.
+
 Uncommitted changes on Linux remain visible from the Mac even when the copies
 are on different branches. Different branches are informational. Confirmed
 history divergence is a problem; different tips with insufficient history remain

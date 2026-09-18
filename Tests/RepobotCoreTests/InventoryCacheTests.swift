@@ -195,6 +195,28 @@ struct InventoryCacheTests {
     #expect(try cache.load()?.first?.repos == snapshot.repos)
   }
 
+  @Test func testVersionTwoMigrationAndAgeOnlyUpdates() throws {
+    let root = try CoreTests().temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    var snapshot = fixture(1)
+    let initial = InventoryCache(directory: root)
+    try initial.save([snapshot])
+    try sql(root, "ALTER TABLE repositories DROP COLUMN age_data; PRAGMA user_version=2;")
+    let cache = InventoryCache(directory: root)
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+    snapshot.repos[0].age = RepositoryAge(measuredAt: Date(timeIntervalSince1970: 1234.125),
+      newestFileDate: Date(timeIntervalSince1970: 1000))
+    try cache.save([snapshot])
+    #expect(try scalar(root, "PRAGMA user_version") == "3")
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+    let originalPayload = try scalar(root, "SELECT hex(data) FROM repositories")
+    snapshot.repos[0].age?.measuredAt = Date(timeIntervalSince1970: 1240.375)
+    try cache.save([snapshot])
+    #expect(cache.encodedRepositories == 1 && cache.freshnessOnlyWrites == 1)
+    #expect(try scalar(root, "SELECT hex(data) FROM repositories") == originalPayload)
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+  }
+
   @Test func testVersionOneMigrationIsAtomicAndPreservesInventory() throws {
     let root = try CoreTests().temporary()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -227,7 +249,7 @@ struct InventoryCacheTests {
     #expect(try cache.load()?.first?.repos == snapshot.repos)
     try sql(root, "DROP TRIGGER fail_migration")
     try cache.save([snapshot])
-    #expect(try scalar(root, "PRAGMA user_version") == "2")
+    #expect(try scalar(root, "PRAGMA user_version") == "3")
     #expect(try cache.load()?.first?.repos == snapshot.repos)
     snapshot.repos[0].probedAt = Date(timeIntervalSince1970: 3000)
     try cache.save([snapshot])

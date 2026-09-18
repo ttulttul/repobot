@@ -138,6 +138,93 @@ private final class MapChangeCounter: @unchecked Sendable {
     #expect(reopened.visibleGroups.map(\.summary) == model.visibleGroups.map(\.summary))
   }
 
+  @Test func testAgeUpdatesDoNotReanalyzeOrInvalidateRepositoryRowsAndClockWarningsCompareHosts() throws {
+    var envs = inventory(), analyzer = IncrementalAnalyzer()
+    let model = RepositoryMapModel(), configuration = Configuration()
+    model.update(analyzer.analyze(envs, configuration: configuration))
+    let group = try #require(model.visibleGroups.first { $0.id.hasSuffix("/12") })
+    let row = try #require(group.rows.first { $0.clone.environmentID == envs[0].id })
+    let contentChanges = MapChangeCounter(), ageChanges = MapChangeCounter()
+    withObservationTracking { _ = row.content } onChange: { contentChanges.increment() }
+    withObservationTracking { _ = row.age } onChange: { ageChanges.increment() }
+    let analyzed = analyzer.analyzedClones, refreshed = model.refreshedGroups
+    func sample(_ offset: Double) -> RepositoryAge {
+      let date = Date(timeIntervalSince1970: 1000)
+      return RepositoryAge(measuredAt: date.addingTimeInterval(offset), newestFileDate: date.addingTimeInterval(-86400),
+        clock: MachineClock(sourceStart: date.addingTimeInterval(offset), sourceEnd: date.addingTimeInterval(offset),
+          localStart: date, localEnd: date.addingTimeInterval(0.1), elapsed: 0.1))
+    }
+    envs[0].repos[12].age = sample(4)
+    envs[1].repos[12].age = sample(-4)
+    model.update(analyzer.analyze(envs, configuration: configuration))
+    #expect(analyzer.analyzedClones == analyzed)
+    #expect(model.refreshedGroups == refreshed)
+    #expect(contentChanges.value == 0 && ageChanges.value == 1)
+    #expect(row.age == envs[0].repos[12].age)
+    #expect(model.progress.clockMessages.count == 1)
+    #expect(model.progress.clockMessages.first?.text.contains("Last measured clocks differ") == true)
+    envs[0].repos[12].age = sample(0)
+    envs[1].repos[12].age = sample(0)
+    model.update(analyzer.analyze(envs, configuration: configuration))
+    #expect(model.progress.clockMessages.isEmpty)
+    #expect(RepositoryAgeView.describe(86400 * 180) == "6 months ago")
+    #expect(RepositoryAgeView.describe(-120) == "2 minutes in the future")
+  }
+
+  @Test func testSelectionFollowsSearchAndSurvivesRefreshAndRemoval() throws {
+    var envs = inventory(), analyzer = IncrementalAnalyzer()
+    let model = RepositoryMapModel()
+    func update() { model.update(analyzer.analyze(envs, configuration: Configuration())) }
+    update()
+    #expect(model.selectedGroupID == model.visibleGroups.first?.id)
+    let selected = try #require(model.visibleGroups.first { $0.id.hasSuffix("/12") })
+    model.selectedGroupID = selected.id
+    envs[0].repos[3].modified = 1 // Reordering should not change selection.
+    update()
+    #expect(model.selectedGroup === selected)
+    model.search = "  EXAMPLE.TEST/ORG/12  "
+    #expect(model.visibleGroups.count == 1)
+    #expect(model.selectedGroup === selected)
+    model.search = "no-such-repository"
+    #expect(model.selectedGroupID == nil)
+    #expect(model.selectedGroup == nil)
+    model.search = "Host 2"
+    #expect(model.selectedGroupID == model.visibleGroups.first?.id)
+    model.search = ""
+    model.selectedGroupID = selected.id
+    for host in envs.indices { envs[host].repos.remove(at: 12) }
+    update()
+    #expect(model.selectedGroupID != selected.id)
+    #expect(model.selectedGroupID == model.visibleGroups.first?.id)
+    envs.removeAll()
+    update()
+    #expect(model.selectedGroupID == nil)
+  }
+
+  @Test func testOverviewCountsVerifiedCopiesAndStashesWithoutDoubleCountingPushes() throws {
+    var envs = inventory(), analyzer = IncrementalAnalyzer()
+    let model = RepositoryMapModel()
+    envs[0].repos[12].modified = 2
+    envs[0].repos[12].ahead = 3
+    envs[0].repos[12].stashCount = 2
+    envs[0].repos[12].branchWork = [BranchWork(name: "feature", upstream: "origin/feature", ahead: 2, behind: 0)]
+    envs[1].repos[12].stashCount = 1
+    envs[2].repos[12].modified = 1
+    envs[2].repos[12].stashCount = 4
+    envs[2].repos[12].awaitingFreshCheck = true
+    model.update(analyzer.analyze(envs, configuration: Configuration()))
+    let group = try #require(model.visibleGroups.first { $0.id.hasSuffix("/12") })
+    #expect(group.name == "12")
+    #expect(group.location == "example.test/org")
+    #expect(group.overview == .init(changedCopies: 1, pendingPushCopies: 1, stashes: 3, unverifiedCopies: 1))
+    envs[2].repos[12].awaitingFreshCheck = false
+    model.update(analyzer.analyze(envs, configuration: Configuration()))
+    #expect(group.overview == .init(changedCopies: 2, pendingPushCopies: 1, stashes: 7, unverifiedCopies: 0))
+    envs[0].error = "Offline"
+    model.update(analyzer.analyze(envs, configuration: Configuration()))
+    #expect(group.overview == .init(changedCopies: 1, pendingPushCopies: 0, stashes: 5, unverifiedCopies: 1))
+  }
+
   @Test func testChangedRowsOnlyAndMissedPublicationsRecover() throws {
     var envs = inventory(), analyzer = IncrementalAnalyzer()
     let model = RepositoryMapModel()

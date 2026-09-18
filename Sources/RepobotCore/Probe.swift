@@ -48,6 +48,8 @@ public enum Probe {
       let local = try await repos(paths, peers: peers, peerMap: peerMap, using: transport)
       return try await checkUpstreams(local, peers: peers, peerMap: peerMap, method: upstream, using: transport)
     }
+    let startedAt = Date()
+    let started = ContinuousClock.now
     let result = try await transport.run(
       script: Scripts.load("probe.sh"),
       arguments: [upstream.rawValue]
@@ -60,7 +62,10 @@ public enum Probe {
       throw RepobotError.message(
         result.errorText.isEmpty ? "Probe exited with status \(result.status)" : result.errorText)
     }
-    let repos = try parse(result.stdout)
+    let finishedAt = Date()
+    let elapsed = started.duration(to: .now).components
+    let repos = try parse(result.stdout, now: finishedAt, startedAt: startedAt,
+                          elapsed: Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18)
     guard repos.count == paths.count else {
       throw RepobotError.message("Incomplete probe response")
     }
@@ -169,11 +174,19 @@ public enum Probe {
     }
     return value
   }
-  public static func parse(_ data: Data, now: Date = Date()) throws -> [RepoSnapshot] {
+  public static func parse(_ data: Data, now: Date = Date(), startedAt: Date? = nil,
+                           elapsed: TimeInterval? = nil) throws -> [RepoSnapshot] {
     let fields = tokens(data)
     var index = 0
     var output: [RepoSnapshot] = []
     var repo: RepoSnapshot?
+    var sourceStart: Date?, sourceEnd: Date?
+    func timestamp(_ value: String) throws -> Date {
+      guard let seconds = Double(value), seconds.isFinite else {
+        throw RepobotError.message("Invalid probe timestamp")
+      }
+      return Date(timeIntervalSince1970: seconds)
+    }
     func take(_ count: Int) throws -> [String] {
       guard index + count <= fields.count else {
         throw RepobotError.message("Truncated probe response")
@@ -183,6 +196,12 @@ public enum Probe {
     }
     while index < fields.count {
       let key = try take(1)[0]
+      if key == "CLOCKSTART" || key == "CLOCKEND" {
+        guard repo == nil else { throw RepobotError.message("Clock boundary inside repository") }
+        let date = try timestamp(take(1)[0])
+        if key == "CLOCKSTART" { sourceStart = date } else { sourceEnd = date }
+        continue
+      }
       if key == "REPO" {
         guard repo == nil else { throw RepobotError.message("Nested probe record") }
         repo = RepoSnapshot(path: try take(1)[0])
@@ -191,6 +210,15 @@ public enum Probe {
       }
       guard var r = repo else { throw RepobotError.message("Probe field outside repository") }
       switch key {
+      case "FILEAGE":
+        let v = try take(2)
+        r.age = RepositoryAge(measuredAt: .distantPast,
+          newestFileDate: v[0].isEmpty ? nil : try timestamp(v[0]),
+          fileScanError: v[1].isEmpty ? nil : v[1])
+      case "AGECLOCK":
+        let date = try timestamp(take(1)[0])
+        if r.age == nil { r.age = RepositoryAge(measuredAt: date) }
+        else { r.age?.measuredAt = date }
       case "FINGERPRINT":
         let value = try take(1)[0]; r.probeFingerprint = value.isEmpty ? nil : value
       case "REUSED": r.reusedProbeFacts = true
@@ -261,6 +289,9 @@ public enum Probe {
           r.upstreamRemoteTip = v[1]
         }
       case "END":
+        if r.age?.measuredAt == .distantPast {
+          throw RepobotError.message("File age is missing its source clock")
+        }
         guard try take(1)[0] == r.path else {
           throw RepobotError.message("Mismatched probe record")
         }
@@ -272,6 +303,11 @@ public enum Probe {
       repo = r
     }
     guard repo == nil else { throw RepobotError.message("Unterminated probe record") }
+    if let sourceStart, let sourceEnd, let startedAt, let elapsed {
+      let clock = MachineClock(sourceStart: sourceStart, sourceEnd: sourceEnd,
+                               localStart: startedAt, localEnd: now, elapsed: elapsed)
+      for index in output.indices { output[index].age?.clock = clock }
+    }
     return output
   }
 }

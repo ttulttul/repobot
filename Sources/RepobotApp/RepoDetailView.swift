@@ -36,9 +36,10 @@ struct RepoDetailView: View {
               Text("\(clone.repo.ahead) ahead · \(clone.repo.behind) behind (last fetched state)")
               Text("\(clone.repo.headSHA.prefix(10)) · \(clone.repo.lastCommitSubject)")
                 .textSelection(.enabled)
-              Text(
-                "Committed \(clone.repo.lastCommitDate.formatted(.relative(presentation:.named))) · Checked \(clone.repo.probedAt.formatted(.relative(presentation:.named)))"
-              ).font(.caption).foregroundStyle(.secondary)
+              RepositoryAgeView(age: clone.repo.age,
+                lastCommitDate: clone.repo.headSHA.isEmpty ? nil : clone.repo.lastCommitDate, detailed: true)
+              Text("Checked \(clone.repo.probedAt.formatted(.relative(presentation:.named)))")
+                .font(.caption).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading).padding(6)
           }
           GroupBox("Working tree") {
@@ -75,9 +76,10 @@ struct RepoDetailView: View {
                     VStack(alignment: .trailing) {
                       Text("\(peer.branch ?? "Detached") · \(peer.tip.prefix(8))")
                       Text(peer.text).font(.caption)
-                      Text("Last commit \(peer.lastActivity.formatted(.relative(presentation: .named)))").font(
-                        .caption2
-                      ).foregroundStyle(.secondary)
+                      if let other = state.world.clones.first(where: { $0.id == peer.id }) {
+                        RepositoryAgeView(age: other.repo.age,
+                          lastCommitDate: other.repo.headSHA.isEmpty ? nil : other.repo.lastCommitDate)
+                      }
                     }
                   }
                 }

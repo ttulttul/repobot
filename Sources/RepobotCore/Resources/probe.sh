@@ -19,6 +19,28 @@ bounded_git() {
     kill "$timer" 2>/dev/null; wait "$timer" 2>/dev/null
     return "$result"
 }
+# Scan every regular working-tree file, including ignored files. Directory mtimes
+# and symlink targets are not evidence of file edits. Git metadata may live at a
+# custom path inside the work tree, or in a shared worktree directory.
+file_age() (
+    age_tmp=$(mktemp -d "${TMPDIR:-/tmp}/repobot-age.XXXXXXXX") || {
+        emit FILEAGE '' 'Could not create file scan workspace'; return
+    }
+    trap 'rm -rf "$age_tmp"' EXIT HUP INT TERM
+    if stat -f %m "$PWD" >/dev/null 2>&1; then age_style=bsd; else age_style=gnu; fi
+    if [ "$age_style" = bsd ]; then
+        find "$PWD" \( -name .git -o -name .DS_Store -o -name '._*' -o -path "$g" -o -path "$common" \) -prune -o -type f -exec stat -f %m {} + >"$age_tmp/times" 2>"$age_tmp/errors"
+    else
+        find "$PWD" \( -name .git -o -name .DS_Store -o -name '._*' -o -path "$g" -o -path "$common" \) -prune -o -type f -exec stat -c %Y -- {} + >"$age_tmp/times" 2>"$age_tmp/errors"
+    fi
+    age_status=$?
+    if [ "$age_status" -ne 0 ] || [ -s "$age_tmp/errors" ]; then
+        emit FILEAGE '' 'Some files could not be inspected; newest file age is unavailable'
+    else
+        emit FILEAGE "$(awk '/^-?[0-9]+$/ {if (!seen || $0>newest) newest=$0; seen=1} END {if(seen) printf "%.0f",newest}' "$age_tmp/times")" ''
+    fi
+)
+emit CLOCKSTART "$(date +%s)"
 history_fingerprint() {
     command -v openssl >/dev/null 2>&1 || return
     {
@@ -41,7 +63,7 @@ while [ "$#" -ge 2 ]; do
     case "$peers" in cache:*) previous_fingerprint=${peers%% *}; previous_fingerprint=${previous_fingerprint#cache:}; peers=${peers#* };; esac
     case "$repo" in '~') repo=$HOME;; '~/'*) repo=$HOME/${repo#\~/};; esac
     emit REPO "$repo"
-    if ! cd "$repo" 2>/dev/null; then emit ERR 'Repository is missing' END "$repo"; continue; fi
+    if ! cd -P "$repo" 2>/dev/null; then emit ERR 'Repository is missing' END "$repo"; continue; fi
     g=$(git rev-parse --absolute-git-dir 2>/dev/null)
     if [ -z "$g" ]; then emit ERR 'Not a working repository' END "$repo"; continue; fi
     emit GITDIR "$g"
@@ -88,6 +110,8 @@ while [ "$#" -ge 2 ]; do
     emit OP "$op"
     lock=0; [ -n "$(find "$g/index.lock" -mmin +10 2>/dev/null)" ] && lock=1
     emit LOCK "$lock"
+    file_age
+    emit AGECLOCK "$(date +%s)"
     fingerprint=$(history_fingerprint)
     case "$fingerprint" in ''|*[!0-9a-f]*) fingerprint=;; esac
     [ -z "$fingerprint" ] || emit FINGERPRINT "$fingerprint"
@@ -141,3 +165,4 @@ while [ "$#" -ge 2 ]; do
     if [ -n "$fingerprint" ] && [ "$(history_fingerprint)" != "$fingerprint" ]; then emit FINGERPRINT ''; fi
     emit SLOW "$status_elapsed" END "$repo"
 done
+emit CLOCKEND "$(date +%s)"

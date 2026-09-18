@@ -32,12 +32,14 @@ final class InventoryCache {
     var copy = repo
     copy.probedAt = Date(timeIntervalSinceReferenceDate: 0)
     copy.upstreamCheckedAt = nil
+    copy.age = nil
     return copy
   }
   // Reference-date seconds preserve Foundation Date precision, including fractional seconds.
-  private func freshness(_ repo: RepoSnapshot) -> [Database.Value] {
+  private func freshness(_ repo: RepoSnapshot) throws -> [Database.Value] {
     [.real(repo.probedAt.timeIntervalSinceReferenceDate),
-     repo.upstreamCheckedAt.map { .real($0.timeIntervalSinceReferenceDate) } ?? .null]
+     repo.upstreamCheckedAt.map { .real($0.timeIntervalSinceReferenceDate) } ?? .null,
+     try repo.age.map { .blob(try JSONEncoder().encode($0)) } ?? .null]
   }
   private(set) var examinedRepositories = 0
   init(directory: URL) { self.directory = directory }
@@ -55,7 +57,7 @@ final class InventoryCache {
     defer { try? db.execute("COMMIT") }
     // A file left by an interrupted first initialization is not a committed inventory.
     let version = try db.scalar("PRAGMA user_version")
-    guard version == "1" || version == "2" else {
+    guard version == "1" || version == "2" || version == "3" else {
       if version == "0" { return nil }
       throw RepobotError.message("Unsupported inventory cache version")
     }
@@ -67,13 +69,16 @@ final class InventoryCache {
     }
     records.sort { $0.position < $1.position }
     var repositories: [String: [RepoSnapshot]] = [:]
-    let columns = version == "2" ? ", probed_at, upstream_checked_at" : ""
+    let columns = version == "1" ? "" : ", probed_at, upstream_checked_at" + (version == "3" ? ", age_data" : "")
     try db.rows("SELECT environment, data\(columns) FROM repositories ORDER BY position") { row in
       var repo = try decoder.decode(RepoSnapshot.self, from: row.blob(1))
-      if version == "2" {
+      if version != "1" {
         guard let probedAt = row.real(2) else { throw RepobotError.message("Inventory cache is missing repository freshness") }
         repo.probedAt = Date(timeIntervalSinceReferenceDate: probedAt)
         repo.upstreamCheckedAt = row.real(3).map { Date(timeIntervalSinceReferenceDate: $0) }
+        if version == "3", !row.blob(4).isEmpty {
+          repo.age = try JSONDecoder().decode(RepositoryAge.self, from: row.blob(4))
+        }
       }
       repositories[row.string(0), default: []].append(repo)
     }
@@ -136,9 +141,9 @@ final class InventoryCache {
       databaseIdentity = fileIdentity(); openedConnections += 1
     }
     let db = database!
-    let version = schemaReady ? "2" : try db.scalar("PRAGMA user_version")
+    let version = schemaReady ? "3" : try db.scalar("PRAGMA user_version")
     if !schemaReady {
-      guard version == "0" || version == "1" || version == "2" else { throw RepobotError.message("Unsupported inventory cache version") }
+      guard version == "0" || version == "1" || version == "2" || version == "3" else { throw RepobotError.message("Unsupported inventory cache version") }
       try db.execute("PRAGMA journal_mode=DELETE")
       try db.execute("PRAGMA synchronous=FULL")
     }
@@ -148,12 +153,15 @@ final class InventoryCache {
     if !schemaReady {
       try db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
       try db.execute("CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, data BLOB NOT NULL)")
-      try db.execute("CREATE TABLE IF NOT EXISTS repositories (environment TEXT NOT NULL, path TEXT NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, probed_at REAL NOT NULL, upstream_checked_at REAL, PRIMARY KEY(environment, path))")
+      try db.execute("CREATE TABLE IF NOT EXISTS repositories (environment TEXT NOT NULL, path TEXT NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, probed_at REAL NOT NULL, upstream_checked_at REAL, age_data BLOB, PRIMARY KEY(environment, path))")
       if version == "1" {
         // The first checkpoint below replaces the complete inventory in this same transaction.
         // A failed migration rolls back both schema and data; v1 remains readable until commit.
         try db.execute("ALTER TABLE repositories ADD COLUMN probed_at REAL")
         try db.execute("ALTER TABLE repositories ADD COLUMN upstream_checked_at REAL")
+      }
+      if version == "1" || version == "2" {
+        try db.execute("ALTER TABLE repositories ADD COLUMN age_data BLOB")
       }
     }
     if !initialized {
@@ -173,19 +181,19 @@ final class InventoryCache {
       let payload = facts(record.repo)
       if let previous = savedRepos[key], facts(previous.repo) == payload {
         // Position and observation times are small scalar updates, even when a repo is unchanged.
-        try db.execute("UPDATE repositories SET position=?, probed_at=?, upstream_checked_at=? WHERE environment=? AND path=?",
-          [.integer(record.position)] + freshness(record.repo) + [.text(key.environment), .text(key.path)])
+        try db.execute("UPDATE repositories SET position=?, probed_at=?, upstream_checked_at=?, age_data=? WHERE environment=? AND path=?",
+          [.integer(record.position)] + (try freshness(record.repo)) + [.text(key.environment), .text(key.path)])
         freshnessWrites += 1
       } else {
         let data = try encoder.encode(payload)
-        try db.execute("INSERT INTO repositories (environment, path, position, data, probed_at, upstream_checked_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(environment, path) DO UPDATE SET position=excluded.position, data=excluded.data, probed_at=excluded.probed_at, upstream_checked_at=excluded.upstream_checked_at",
-          [.text(key.environment), .text(key.path), .integer(record.position), .blob(data)] + freshness(record.repo))
+        try db.execute("INSERT INTO repositories (environment, path, position, data, probed_at, upstream_checked_at, age_data) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(environment, path) DO UPDATE SET position=excluded.position, data=excluded.data, probed_at=excluded.probed_at, upstream_checked_at=excluded.upstream_checked_at, age_data=excluded.age_data",
+          [.text(key.environment), .text(key.path), .integer(record.position), .blob(data)] + (try freshness(record.repo)))
         encoded += 1
       }
     }
     if !initialized {
       try db.execute("INSERT OR REPLACE INTO metadata VALUES ('complete', '1')")
-      try db.execute("PRAGMA user_version=2")
+      try db.execute("PRAGMA user_version=3")
     }
     try db.execute("COMMIT")
     committed = true; schemaReady = true

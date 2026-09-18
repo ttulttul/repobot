@@ -46,6 +46,9 @@ struct SelectiveProbeTests {
     #expect(!transport.calls().dropFirst(before).contains { $0.contains("rev-list --max-parents") })
     let full = try await Probe.repos([repo.path], using: transport)[0]
     fast.probedAt = full.probedAt
+    // Measurement times and transport bounds differ between invocations.
+    #expect(fast.age?.newestFileDate == full.age?.newestFileDate)
+    fast.age = full.age
     #expect(fast == full)
     try await helper.git(repo, ["commit", "-am", "Work"])
     var next = try await Probe.repos([repo.path], previous: [repo.path: fast], using: transport)[0]
