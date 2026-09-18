@@ -18,13 +18,13 @@ private final class MapChangeCounter: @unchecked Sendable {
     (0..<3).map { host in
       var env = EnvironmentSnapshot(environment: RepobotCore.Environment(name: "Host \(host)", kind: .local))
       env.checkedAt = Date()
-      env.repos = (0..<80).map { index in
+      env.repos = SnapshotList((0..<80).map { index in
         var repo = RepoSnapshot(path: "/repos/\(index)")
         repo.originURL = "https://example.test/org/\(index).git"
         repo.branch = "main"; repo.headSHA = "tip"; repo.upstream = "origin/main"
         repo.upstreamSHA = "tip"
         return repo
-      }
+      })
       return env
     }
   }
@@ -135,6 +135,43 @@ private final class MapChangeCounter: @unchecked Sendable {
     reopened.update(world)
     compare(reopened, world)
     #expect(reopened.visibleGroups.map(\.summary) == model.visibleGroups.map(\.summary))
+  }
+
+  @Test func testChangedRowsOnlyAndMissedPublicationsRecover() throws {
+    var envs = inventory(), analyzer = IncrementalAnalyzer()
+    let model = RepositoryMapModel()
+    let config = Configuration()
+    model.update(analyzer.analyze(envs, configuration: config))
+    let initial = model.visitedRows
+    func change(_ index: Int) -> WorldSnapshot {
+      envs[0].repos[index].modified += 1
+      let repo = envs[0].repos[index]
+      return analyzer.analyze(envs, configuration: config, changes: [
+        RepositoryID(environment: envs[0].id, path: repo.path): RepositoryChange(repo: repo, position: index)
+      ])
+    }
+    var world = change(12)
+    model.update(world)
+    #expect(model.visitedRows - initial == 3)
+    compare(model, world)
+    let visited = model.visitedRows
+    world.environments[0].checkProgress = "Just progress"
+    model.update(world)
+    #expect(model.visitedRows == visited)
+    #expect(model.progress.messages.first?.text == "Host 0: Just progress")
+    _ = change(13) // AsyncStream may replace this publication before the UI sees it.
+    world = change(14)
+    model.update(world)
+    #expect(model.visitedRows - visited == 240)
+    compare(model, world)
+    for index in [12, 13, 14] {
+      let group = try #require(model.visibleGroups.first { $0.id.hasSuffix("/\(index)") })
+      #expect(group.summary == "Uncommitted work on Host 0")
+    }
+    let refreshed = model.visitedRows
+    world = change(15)
+    model.update(world)
+    #expect(model.visitedRows - refreshed == 3)
   }
 
   @Test func testClosingDetachesHostingTreeEvenWhenWindowRemainsRetained() {

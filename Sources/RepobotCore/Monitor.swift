@@ -5,6 +5,15 @@ public actor EnvironmentMonitor {
   public let environment: Environment
   private let configuration: Configuration, store: StateStore
   private var transport: any Transport
+  private var repoPositions: [String: Int] = [:]
+  private var repositoryWatchPaths: [String: [String]] = [:]
+  private func indexRepositories() {
+    repoPositions = Dictionary(uniqueKeysWithValues: snapshot.repos.enumerated().map { ($0.element.path, $0.offset) })
+    repositoryWatchPaths = Dictionary(uniqueKeysWithValues: snapshot.repos.map { repo in
+      let paths = [repo.path] + repo.gitDirectories
+      return (repo.path, environment.kind == .local ? paths.map(LocalWatcher.physicalPath) : paths)
+    })
+  }
   private var snapshot: EnvironmentSnapshot
   private var loop: Task<Void, Never>?, debounce: Task<Void, Never>?
   private var localWatcher: LocalWatcher?, remoteWatcher: RemoteWatcher?
@@ -12,6 +21,9 @@ public actor EnvironmentMonitor {
     upstreamChecked = Date.distantPast
   private var lastHeartbeat = Date(), retryAt = Date.distantPast, backoff: Double = 5
   private var busy = false, pending = false, stopped = true, forceDiscovery = false
+  private var sweepQueued = false
+  private(set) var timerFirings = 0
+  private(set) var scheduledDeadline: Date?
   private var changed: Set<String> = []
   private var pendingFull = false, pendingUpstream = false
   private var pendingReason = "Queued check"
@@ -37,20 +49,45 @@ public actor EnvironmentMonitor {
     capabilities = environment.capabilities
   }
   public func start() {
-    guard loop == nil else { return }
+    guard stopped else { return }
     stopped = false
+    scheduleTick()
+  }
+  private func pollingInterval() -> Double {
+    if localWatcher != nil || remoteWatcher != nil { return configuration.safetyInterval }
+    return (environment.pollInterval ?? configuration.pollInterval)
+      * PowerPolicy.currentMultiplier(enabled: configuration.batteryAware)
+  }
+  private func scheduleTick() {
+    loop?.cancel(); loop = nil; scheduledDeadline = nil
+    guard !stopped else { return }
+    let now = Date()
+    let events = localWatcher != nil || remoteWatcher != nil
+    let date = MonitorDeadline.next(now: now, busy: busy || sweepQueued, events: events,
+      remote: remoteWatcher != nil, canRetryWatcher: capabilities != nil && environment.watchMode != .poll,
+      swept: swept, upstream: upstreamChecked, retrySweep: sweepRetryAt, retryWatcher: retryAt,
+      heartbeat: lastHeartbeat, interval: pollingInterval(), upstreamInterval: configuration.upstreamInterval,
+      batteryAware: configuration.batteryAware)
+    guard let date else { return }
+    scheduledDeadline = date
     loop = Task { [weak self] in
-      while !Task.isCancelled {
-        guard let self else { return }
-        await self.tick()
-        try? await Task.sleep(for: .seconds(1))
-      }
+      do {
+        try await Task.sleep(for: .seconds(max(0.001, date.timeIntervalSinceNow)))
+        guard !Task.isCancelled else { return }
+        await self?.timerFired()
+      } catch {}
     }
+  }
+  private func timerFired() async {
+    guard !stopped else { return }
+    loop = nil; scheduledDeadline = nil; timerFirings += 1
+    await tick()
+    scheduleTick()
   }
   public func stop() async {
     stopped = true
     loop?.cancel()
-    loop = nil
+    loop = nil; scheduledDeadline = nil
     debounce?.cancel()
     debounce = nil
     activeSweep?.cancel()
@@ -79,21 +116,21 @@ public actor EnvironmentMonitor {
   }
   private func tick() async {
     guard !stopped else { return }
-    let events = localWatcher != nil || remoteWatcher != nil
-    if remoteWatcher != nil && Date().timeIntervalSince(lastHeartbeat) > 65 {
+    if remoteWatcher != nil && Date().timeIntervalSince(lastHeartbeat) >= 65 {
       await watcherFailed("Remote watcher heartbeat was not received for 65 seconds")
     }
-    let interval =
-      events
-      ? configuration.safetyInterval
-      : (environment.pollInterval ?? configuration.pollInterval)
-        * PowerPolicy.currentMultiplier(enabled: configuration.batteryAware)
-    if !busy && Date() >= sweepRetryAt && (Date().timeIntervalSince(swept) >= interval
-      || Date().timeIntervalSince(upstreamChecked) >= configuration.upstreamInterval)
-    {
-      await sweep(full: true, reason: swept == .distantPast ? "Startup check" : "Scheduled check")
+    if localWatcher == nil && remoteWatcher == nil && environment.watchMode != .poll && Date() >= retryAt {
+      await startWatcher()
     }
-    if !events && environment.watchMode != .poll && Date() >= retryAt { await startWatcher() }
+    guard !stopped else { return }
+    if !busy && !sweepQueued && Date() >= sweepRetryAt && (Date().timeIntervalSince(swept) >= pollingInterval()
+      || Date().timeIntervalSince(upstreamChecked) >= configuration.upstreamInterval) {
+      sweepQueued = true
+      activeSweep = Task {
+        self.sweepQueued = false
+        await self.sweep(full: true, reason: self.swept == .distantPast ? "Startup check" : "Scheduled check")
+      }
+    }
   }
   private func sweep(full: Bool, forceUpstream: Bool = false, reason: String = "Filesystem change") async {
     guard !stopped else { return }
@@ -105,6 +142,7 @@ public actor EnvironmentMonitor {
       return
     }
     busy = true
+    scheduleTick()
     defer {
       busy = false
       if pending {
@@ -112,6 +150,7 @@ public actor EnvironmentMonitor {
         pending = false; pendingFull = false; pendingUpstream = false
         activeSweep = Task { await self.sweep(full: full, forceUpstream: upstream, reason: reason) }
       }
+      scheduleTick()
     }
     do {
       if !hasRestoredSnapshot {
@@ -119,6 +158,7 @@ public actor EnvironmentMonitor {
           snapshot = cached
           snapshot.environment = environment
         }
+        indexRepositories()
         hasRestoredSnapshot = true
       }
       guard !stopped, !Task.isCancelled else { return }
@@ -144,7 +184,10 @@ public actor EnvironmentMonitor {
         capabilities = try await Probe.capabilities(using: transport)
         snapshot.environment.capabilities = capabilities
       }
-      var paths = snapshot.repos.map(\.path)
+      var paths = full ? snapshot.repos.map(\.path)
+        : changed.filter { repoPositions[$0] != nil }.sorted {
+          repoPositions[$0, default: 0] < repoPositions[$1, default: 0]
+        }
       var rediscovered = false
       if forceDiscovery || Date().timeIntervalSince(discovered) > 600 {
         paths = try await Probe.discover(roots: environment.roots, using: transport)
@@ -157,24 +200,29 @@ public actor EnvironmentMonitor {
       let method = checkUpstream ? environment.upstreamCheck ?? configuration.upstreamCheck : .off
       if !full && !rediscovered {
         paths = paths.filter { path in
-          changed.contains(path) && !(snapshot.repos.first { $0.path == path }?.slow ?? false)
+          changed.contains(path) && !(repoPositions[path].map { snapshot.repos[$0].slow } ?? false)
         }
       }
       changed.removeAll()
       let allPaths = paths
       let safetyDue = Date().timeIntervalSince(safetySwept) >= configuration.safetyInterval
       if !safetyDue && !forceUpstream {
-        paths = paths.filter { path in !(snapshot.repos.first { $0.path == path }?.slow ?? false) }
+        paths = paths.filter { path in !(repoPositions[path].map { snapshot.repos[$0].slow } ?? false) }
       }
-      let peerMap = await store.peerMap(for: environment.id)
+      let peerMap = await store.peerMap(for: environment.id, paths: Set(paths))
       if full || rediscovered {
         let old = Dictionary(uniqueKeysWithValues: snapshot.repos.map { ($0.path, $0) })
-        snapshot.repos = allPaths.map { path in
+        snapshot.repos = SnapshotList(allPaths.map { path in
           if let previous = old[path] { return previous }
           var repo = RepoSnapshot(path: path)
           repo.awaitingFreshCheck = true
           return repo
-        }
+        })
+        indexRepositories()
+        // Successful discovery is authoritative even if the previous connection failed.
+        // Clear that error before merging, so an empty discovery can remove stale copies.
+        snapshot.error = nil
+        await store.merge(snapshot)
       }
       // Watch while probing so edits made during a large sweep queue a follow-up.
       if rediscovered { stopWatchers() }
@@ -190,11 +238,12 @@ public actor EnvironmentMonitor {
       snapshot.error = nil
       await startWatcher()
       snapshot.checkProgress = nil
-      await store.merge(snapshot)
+      await store.merge(snapshot, changedPaths: [])
       if method != .off {
-        let upstreamPaths = snapshot.repos.filter {
-          paths.contains($0.path) && $0.error == nil && $0.upstream != nil
-        }.map(\.path)
+        let upstreamPaths = paths.filter { path in
+          guard let index = repoPositions[path] else { return false }
+          return snapshot.repos[index].error == nil && snapshot.repos[index].upstream != nil
+        }
         try await probeBatches(upstreamPaths, peerMap: peerMap, upstream: method, batchSize: 4)
       }
       guard !stopped, !Task.isCancelled else { return }
@@ -203,7 +252,7 @@ public actor EnvironmentMonitor {
       if checkUpstream { upstreamChecked = Date() }
       snapshot.lastCheckFinishedAt = Date()
       snapshot.checkProgress = nil
-      await store.merge(snapshot)
+      await store.merge(snapshot, changedPaths: [])
       await store.flush()
     } catch {
       guard !stopped else { return }
@@ -212,7 +261,7 @@ public actor EnvironmentMonitor {
       snapshot.error = error.localizedDescription
       swept = Date()
       sweepRetryAt = Date().addingTimeInterval(60)
-      await store.merge(snapshot)
+      await store.merge(snapshot, changedPaths: [])
       await store.flush()
     }
   }
@@ -232,25 +281,44 @@ public actor EnvironmentMonitor {
       if upstream == .off {
         repos = try await Probe.repos(batch, peerMap: peerMap, using: transport)
       } else {
-        let current = Dictionary(uniqueKeysWithValues: snapshot.repos.map { ($0.path, $0) })
-        repos = try await Probe.checkUpstreams(batch.compactMap { current[$0] }, peerMap: peerMap,
+        repos = try await Probe.checkUpstreams(batch.compactMap { path in
+          repoPositions[path].map { snapshot.repos[$0] }
+        }, peerMap: peerMap,
                                               method: upstream, using: transport)
       }
       try Task.checkCancellation()
       guard !stopped else { throw CancellationError() }
-      let updates = Dictionary(uniqueKeysWithValues: repos.map { ($0.path, $0) })
-      snapshot.repos = snapshot.repos.map { updates[$0.path] ?? $0 }
+      for repo in repos {
+        if let index = repoPositions[repo.path] { snapshot.repos[index] = repo }
+      }
       snapshot.error = nil
-      // Merge preserves freshness and activity history for unchanged repositories.
-      await store.merge(snapshot)
+      // Carry the exact probe batch through analysis and durable persistence.
+      await store.merge(snapshot, changedPaths: Set(repos.map(\.path)))
       if let merged = await store.snapshot(for: environment.id) {
         // The store enriches repository ages/freshness. Watcher events may have updated
         // monitor metadata while we awaited it; do not overwrite those newer diagnostics.
         snapshot.repos = merged.repos
       }
+      for path in batch {
+        guard let index = repoPositions[path] else { continue }
+        let repo = snapshot.repos[index]
+        let paths = [repo.path] + repo.gitDirectories
+        repositoryWatchPaths[path] = environment.kind == .local ? paths.map(LocalWatcher.physicalPath) : paths
+      }
+      if let watcher = localWatcher, batch.contains(where: { path in
+        (repositoryWatchPaths[path] ?? []).contains { candidate in
+          !watcher.watchedRoots.contains { $0 == "/" || candidate == $0 || candidate.hasPrefix($0 + "/") }
+        }
+      }) {
+        // A probe may discover an external worktree/common Git directory after
+        // registration. Add its coverage immediately, not at the next discovery.
+        stopWatchers()
+        await startWatcher()
+      }
     }
   }
   private func startWatcher() async {
+    defer { scheduleTick() }
     guard !stopped, environment.watchMode != .poll else {
       snapshot.mode = "Polling"
       return
@@ -284,6 +352,7 @@ public actor EnvironmentMonitor {
   }
   private func event(_ event: WatchEvent, generation: UUID) async {
     guard !stopped, generation == watcherGeneration else { return }
+    defer { scheduleTick() }
     switch event {
     case .ready:
       lastHeartbeat = Date()
@@ -292,7 +361,7 @@ public actor EnvironmentMonitor {
       if snapshot.watcherFailure != nil && snapshot.watcherFailure?.recoveredAt == nil {
         snapshot.watcherFailure?.recoveredAt = Date()
       }
-      await store.merge(snapshot)
+      await store.merge(snapshot, changedPaths: [])
     case .ping: lastHeartbeat = Date()
     case .ended: await watcherFailed("Remote watcher ended unexpectedly")
     case .failed(let message): await watcherFailed(message)
@@ -308,11 +377,15 @@ public actor EnvironmentMonitor {
   func repositoryChanged(_ path: String) async {
     guard !stopped else { return }
     if environment.kind == .local, await store.isCachePath(path) { return }
+    let path = environment.kind == .local ? LocalWatcher.physicalPath(path) : path
     let skipped: Set<String> = [
       "node_modules", ".venv", "vendor", "target", "build", "Library", ".Trash",
     ]
-    if let repo = snapshot.repos.first(where: { path.hasPrefix($0.path + "/") }) {
-      let relative = path.dropFirst(repo.path.count + 1)
+    if let repo = snapshot.repos.first(where: {
+      guard let root = repositoryWatchPaths[$0.path]?.first else { return false }
+      return path.hasPrefix(root + "/")
+    }), let root = repositoryWatchPaths[repo.path]?.first {
+      let relative = path.dropFirst(root.count + 1)
       if relative.split(separator: "/").contains(where: { skipped.contains(String($0)) }) {
         return
       }
@@ -320,8 +393,7 @@ public actor EnvironmentMonitor {
       return
     }
     let matches = snapshot.repos.filter {
-      path == $0.path || path.hasPrefix($0.path + "/")
-        || $0.gitDirectories.contains { path == $0 || path.hasPrefix($0 + "/") }
+      (repositoryWatchPaths[$0.path] ?? [$0.path]).contains { path == $0 || path.hasPrefix($0 + "/") }
     }
     if matches.isEmpty { forceDiscovery = true } else { changed.formUnion(matches.map(\.path)) }
     scheduleDebounce()
@@ -344,6 +416,7 @@ public actor EnvironmentMonitor {
     remoteWatcher = nil
   }
   func watcherFailed(_ message: String) async {
+    defer { scheduleTick() }
     snapshot.watcherFailure = WatcherFailure(message: message)
     logger.error("Watcher failed on \(self.environment.name, privacy: .public): \(message, privacy: .private)")
     stopWatchers()
@@ -351,6 +424,24 @@ public actor EnvironmentMonitor {
     snapshot.mode = "Polling — events reconnecting"
     retryAt = Date().addingTimeInterval(backoff)
     backoff = min(300, backoff * 2)
-    await store.merge(snapshot)
+    await store.merge(snapshot, changedPaths: [])
+  }
+}
+
+/// Pure deadline calculation makes retry/heartbeat/power behavior testable without waiting minutes.
+enum MonitorDeadline {
+  static func next(now: Date, busy: Bool, events: Bool, remote: Bool, canRetryWatcher: Bool,
+                   swept: Date, upstream: Date, retrySweep: Date, retryWatcher: Date,
+                   heartbeat: Date, interval: Double, upstreamInterval: Double, batteryAware: Bool) -> Date? {
+    var dates: [Date] = []
+    if !busy {
+      dates.append(max(retrySweep, min(swept.addingTimeInterval(interval), upstream.addingTimeInterval(upstreamInterval))))
+      // Battery/idle policy is relevant only to polling. Re-evaluate at most once a
+      // minute so waking activity can shorten an extended polling interval.
+      if !events && batteryAware { dates.append(now.addingTimeInterval(60)) }
+    }
+    if !events && canRetryWatcher { dates.append(retryWatcher) }
+    if remote { dates.append(heartbeat.addingTimeInterval(65)) }
+    return dates.min().map { max(now, $0) }
   }
 }

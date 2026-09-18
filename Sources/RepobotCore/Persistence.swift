@@ -36,8 +36,15 @@ public struct Persistence: Sendable {
 }
 public actor StateStore {
   private var snapshots: [UUID: EnvironmentSnapshot] = [:]
+  private var positions: [UUID: [String: Int]] = [:]
+  private var analysisChanges: RepositoryChanges? = nil
+  private var persistenceChanges: RepositoryChanges? = nil
+  var examinedAnalysisCount: Int { analyzer.examinedRepositories }
+  var examinedPersistenceCount: Int { inventoryCache.examinedRepositories }
+  private(set) var mergedRepositoryCount = 0
   private var configuration: Configuration
   private let persistence: Persistence
+  private let physicalCacheDirectory: String
   private let inventoryCache: InventoryCache
   var persistedRepositoryCount: Int { inventoryCache.encodedRepositories }
   private var continuations: [UUID: AsyncStream<WorldSnapshot>.Continuation] = [:]
@@ -60,6 +67,7 @@ public actor StateStore {
   ) {
     self.configuration = configuration
     self.persistence = persistence
+    self.physicalCacheDirectory = LocalWatcher.physicalPath(persistence.directory.path)
     self.inventoryCache = InventoryCache(directory: persistence.directory)
     self.publicationDelay = max(.milliseconds(1), publicationDelay)
     self.persistenceDelay = max(.milliseconds(1), persistenceDelay)
@@ -72,6 +80,7 @@ public actor StateStore {
       snapshot.checkProgress = "Waiting for a fresh check"
       for index in snapshot.repos.indices { snapshot.repos[index].awaitingFreshCheck = true }
       snapshots[snapshot.id] = snapshot
+      positions[snapshot.id] = Dictionary(uniqueKeysWithValues: snapshot.repos.enumerated().map { ($0.element.path, $0.offset) })
     }
   }
   public func stream() -> AsyncStream<WorldSnapshot> {
@@ -87,6 +96,8 @@ public actor StateStore {
   public func updateConfiguration(_ value: Configuration) {
     configuration = value
     snapshots = snapshots.filter { id, _ in value.environments.contains { $0.id == id } }
+    positions = positions.filter { snapshots[$0.key] != nil }
+    analysisChanges = nil; persistenceChanges = nil
     invalidateInventory()
     flush()
   }
@@ -101,76 +112,102 @@ public actor StateStore {
     }
     schedulePublication()
   }
-  public func merge(_ snapshot: EnvironmentSnapshot) {
+  /// nil paths reconcile discovery/membership; explicit paths update only a probe batch.
+  /// Empty paths publish environment metadata without revisiting repository facts.
+  public func merge(_ snapshot: EnvironmentSnapshot, changedPaths: Set<String>? = nil) {
     guard configuration.environments.contains(where: { $0.id == snapshot.id }) else { return }
-    var snapshot = snapshot
-    // A connection failure before the first sweep must not erase cached inventory.
-    // Only a successful discovery can establish that repositories disappeared.
-    if snapshot.error != nil, let previous = snapshots[snapshot.id] {
-      snapshot.repos = previous.repos
-      snapshot.checkedAt = previous.checkedAt
-    }
-    let previous = Dictionary(
-      uniqueKeysWithValues: (snapshots[snapshot.id]?.repos ?? []).map { ($0.path, $0) })
-    for i in snapshot.repos.indices {
-      let old = previous[snapshot.repos[i].path]
-      if let error = snapshot.repos[i].error, var previous = old {
-        previous.error = error
-        previous.slow = previous.slow || snapshot.repos[i].slow
-        snapshot.repos[i] = previous
-        continue
+    let old = snapshots[snapshot.id]
+    let oldPositions = positions[snapshot.id] ?? [:]
+    var next = snapshot
+    var delta: RepositoryChanges = [:]
+    if snapshot.error != nil, let old {
+      next.repos = old.repos
+      next.checkedAt = old.checkedAt
+    } else if let changedPaths, let old {
+      next.repos = old.repos
+      for path in changedPaths {
+        // Ordinary probe batches preserve order. Only an unexpected new/moved path
+        // needs a lookup and full membership reconciliation.
+        guard let index = oldPositions[path], snapshot.repos.indices.contains(index),
+              snapshot.repos[index].path == path else {
+          merge(snapshot)
+          return
+        }
+        let repo = enriched(snapshot.repos[index], previous: old.repos[index])
+        mergedRepositoryCount += 1
+        if repo != old.repos[index] {
+          next.repos[index] = repo
+          delta[RepositoryID(environment: snapshot.id, path: path)] = RepositoryChange(repo: repo, position: index)
+        }
       }
-      let now = snapshot.repos[i].probedAt
-      snapshot.repos[i].dirtySince = snapshot.repos[i].dirty ? old?.dirtySince ?? now : nil
-      let sameBranch = old?.branch == snapshot.repos[i].branch
-      snapshot.repos[i].unpushedSince =
-        snapshot.repos[i].ahead > 0 ? (sameBranch ? old?.unpushedSince : nil) ?? now : nil
-      let sameUpstream =
-        old?.upstream == snapshot.repos[i].upstream && old?.originURL == snapshot.repos[i].originURL
-        && old?.trackingRemoteURL == snapshot.repos[i].trackingRemoteURL
-      if snapshot.repos[i].upstreamCheckedAt == nil && sameUpstream {
-        snapshot.repos[i].upstreamCheckedAt = old?.upstreamCheckedAt
-        snapshot.repos[i].upstreamError = old?.upstreamError
-        snapshot.repos[i].upstreamUnknownSince = old?.upstreamUnknownSince
-        snapshot.repos[i].upstreamRemoteTip = old?.upstreamRemoteTip
-        snapshot.repos[i].upstreamRemoteDeleted = old?.upstreamRemoteDeleted ?? false
-        snapshot.repos[i].upstreamGone =
-          snapshot.repos[i].upstreamGone || snapshot.repos[i].upstreamRemoteDeleted
-      } else if snapshot.repos[i].upstreamError != nil {
-        snapshot.repos[i].upstreamUnknownSince =
-          (sameUpstream ? old?.upstreamUnknownSince : nil) ?? now
+    } else {
+      var nextPositions: [String: Int] = [:]
+      for index in next.repos.indices {
+        let path = next.repos[index].path
+        let previous = oldPositions[path].flatMap { old?.repos[$0] }
+        let repo = enriched(next.repos[index], previous: previous)
+        next.repos[index] = repo
+        nextPositions[path] = index
+        mergedRepositoryCount += 1
+        if repo != previous || oldPositions[path] != index {
+          delta[RepositoryID(environment: snapshot.id, path: path)] = RepositoryChange(repo: repo, position: index)
+        }
       }
+      for path in oldPositions.keys where nextPositions[path] == nil {
+        delta[RepositoryID(environment: snapshot.id, path: path)] = RepositoryChange(repo: nil, position: 0)
+      }
+      positions[snapshot.id] = nextPositions
     }
-    snapshots[snapshot.id] = snapshot
+    snapshots[snapshot.id] = next
+    analysisChanges?.merge(delta) { _, latest in latest }
+    persistenceChanges?.merge(delta) { _, latest in latest }
     invalidateInventory()
+  }
+  private func enriched(_ input: RepoSnapshot, previous old: RepoSnapshot?) -> RepoSnapshot {
+    var repo = input
+    if let error = repo.error, var previous = old {
+      previous.error = error
+      previous.slow = previous.slow || repo.slow
+      return previous
+    }
+    let now = repo.probedAt
+    repo.dirtySince = repo.dirty ? old?.dirtySince ?? now : nil
+    let sameBranch = old?.branch == repo.branch
+    repo.unpushedSince = repo.ahead > 0 ? (sameBranch ? old?.unpushedSince : nil) ?? now : nil
+    let sameUpstream = old?.upstream == repo.upstream && old?.originURL == repo.originURL
+      && old?.trackingRemoteURL == repo.trackingRemoteURL
+    if repo.upstreamCheckedAt == nil && sameUpstream {
+      repo.upstreamCheckedAt = old?.upstreamCheckedAt
+      repo.upstreamError = old?.upstreamError
+      repo.upstreamUnknownSince = old?.upstreamUnknownSince
+      repo.upstreamRemoteTip = old?.upstreamRemoteTip
+      repo.upstreamRemoteDeleted = old?.upstreamRemoteDeleted ?? false
+      repo.upstreamGone = repo.upstreamGone || repo.upstreamRemoteDeleted
+    } else if repo.upstreamError != nil {
+      repo.upstreamUnknownSince = (sameUpstream ? old?.upstreamUnknownSince : nil) ?? now
+    }
+    return repo
   }
   public func isCachePath(_ path: String) -> Bool {
     let directory = persistence.directory.path
     return path == directory || path.hasPrefix(directory + "/")
+      || path == physicalCacheDirectory || path.hasPrefix(physicalCacheDirectory + "/")
   }
   public func world() -> WorldSnapshot {
     if analysisDirty || cachedWorld == nil || (analyzer.nextDeadline ?? .distantFuture) <= Date() {
       cachedWorld = analyzer.analyze(
         configuration.environments.map { snapshots[$0.id] ?? EnvironmentSnapshot(environment: $0) },
-        configuration: configuration)
+        configuration: configuration, changes: analysisChanges)
+      analysisChanges = [:]
       analysisDirty = false
       analysisCount += 1
       scheduleAgeTransition()
     }
     return cachedWorld!
   }
-  public func peerMap(for environmentID: UUID) -> [String: [String]] {
-    let clones = world().clones
-    let groups = Dictionary(grouping: clones, by: { $0.status.identity })
-    var result: [String: [String]] = [:]
-    for clone in clones where clone.environmentID == environmentID {
-      let repo = clone.repo
-      result[repo.path] = Array(Set((groups[clone.status.identity] ?? []).compactMap { other in
-        Analyzer.sameLineOfWork(other.repo, repo) && !other.repo.headSHA.isEmpty
-          && other.repo.headSHA != repo.headSHA ? other.repo.headSHA : nil
-      }))
-    }
-    return result
+  public func peerMap(for environmentID: UUID, paths: Set<String>? = nil) -> [String: [String]] {
+    _ = world()
+    return analyzer.peerMap(for: environmentID, paths: paths)
   }
   private func scheduleAgeTransition() {
     let deadline = analyzer.nextDeadline
@@ -237,8 +274,9 @@ public actor StateStore {
     let previousError = persistenceError
     do {
       let values = configuration.environments.map { snapshots[$0.id] ?? EnvironmentSnapshot(environment: $0) }
-      if try inventoryCache.save(values) { cacheWriteCount += 1 }
+      if try inventoryCache.save(values, changes: persistenceChanges) { cacheWriteCount += 1 }
       cacheDirty = false
+      persistenceChanges = [:]
       persistenceError = nil
     } catch {
       persistenceError = error.localizedDescription

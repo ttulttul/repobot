@@ -2,7 +2,7 @@ import Foundation
 
 /// Reuses each upstream group's findings until one of its inputs or age boundaries changes.
 struct IncrementalAnalyzer {
-  private struct ID: Hashable { var environment: UUID; var path: String }
+  private typealias ID = RepositoryID
   private struct IdentityInput: Equatable {
     var remote: String?; var root: String
     init(_ repo: RepoSnapshot) {
@@ -14,12 +14,22 @@ struct IncrementalAnalyzer {
     var identityInput: IdentityInput
     var group: String
     var repo: RepoSnapshot
-    var name: String
-    var error: String?
     var status: RepoStatus?
   }
   private var entries: [ID: Entry] = [:]
   private var groups: [String: Set<ID>] = [:]
+  private var environmentMembers: [UUID: Set<ID>] = [:]
+  private struct EnvironmentInput: Equatable { var name: String; var error: String? }
+  private var environmentInputs: [UUID: EnvironmentInput] = [:]
+  private var environmentOrder: [UUID] = []
+  private var positions: [ID: Int] = [:]
+  private var clonePositions: [ID: Int] = [:]
+  private var world = WorldSnapshot()
+  private var initialized = false
+  private let source = UUID()
+  private var snapshotRevision: UInt64 = 0
+  private(set) var examinedRepositories = 0
+  private(set) var rebuiltCloneLists = 0
   private var deadlines: [String: Date] = [:]
   private var configuration: Configuration?
   private(set) var revision: UInt64 = 0
@@ -35,45 +45,77 @@ struct IncrementalAnalyzer {
     return a == b
   }
   mutating func analyze(_ snapshots: [EnvironmentSnapshot], configuration config: Configuration,
-                        now: Date = Date()) -> WorldSnapshot {
+                        now: Date = Date(), changes: RepositoryChanges? = nil) -> WorldSnapshot {
     var dirty = Set(deadlines.filter { $0.value <= now }.keys)
     if configuration != config { dirty.formUnion(groups.keys); configuration = config }
-    var present = Set<ID>()
+    let environments = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.id, $0) })
+    let order = snapshots.map(\.id)
+    var structural = !initialized || order != environmentOrder
+    environmentOrder = order
+    // Host availability/name changes affect that host's groups, not unrelated hosts.
     for env in snapshots {
-      for repo in env.repos {
-        let id = ID(environment: env.id, path: repo.path)
-        present.insert(id)
-        let previous = entries[id]
-        let input = IdentityInput(repo)
-        let key: String
-        if let previous, previous.identityInput == input { key = previous.group }
-        else { key = Analyzer.repositoryKey(repo, environmentID: env.id); resolvedIdentities += 1 }
-        if let previous, previous.group != key {
-          groups[previous.group]?.remove(id); dirty.insert(previous.group)
+      let input = EnvironmentInput(name: env.environment.name, error: env.error)
+      if environmentInputs[env.id] != input {
+        for id in environmentMembers[env.id] ?? [] {
+          if let entry = entries[id] { dirty.insert(entry.group) }
         }
-        if previous == nil || previous?.group != key || previous?.name != env.environment.name
-          || previous?.error != env.error || !equivalent(previous!.repo, repo) {
-          dirty.insert(key)
-        }
-        groups[key, default: []].insert(id)
-        entries[id] = Entry(identityInput: input, group: key, repo: repo,
-                            name: env.environment.name, error: env.error, status: previous?.status)
+        environmentInputs[env.id] = input
       }
     }
-    for id in Set(entries.keys).subtracting(present) {
-      if let old = entries.removeValue(forKey: id) {
-        groups[old.group]?.remove(id); dirty.insert(old.group)
+    var delta: RepositoryChanges
+    if let changes, initialized { delta = changes }
+    else {
+      delta = [:]
+      var present = Set<ID>()
+      for env in snapshots {
+        for (position, repo) in env.repos.enumerated() {
+          let id = ID(environment: env.id, path: repo.path)
+          present.insert(id)
+          delta[id] = RepositoryChange(repo: repo, position: position)
+        }
       }
+      for id in Set(entries.keys).subtracting(present) {
+        delta[id] = RepositoryChange(repo: nil, position: 0)
+      }
+    }
+    examinedRepositories += delta.count
+    var affected = Set<ID>()
+    for (id, change) in delta {
+      guard let repo = change.repo, environments[id.environment] != nil else {
+        if let previous = entries.removeValue(forKey: id) {
+          groups[previous.group]?.remove(id); dirty.insert(previous.group)
+          environmentMembers[id.environment]?.remove(id)
+          positions[id] = nil; structural = true
+        }
+        continue
+      }
+      affected.insert(id)
+      let previous = entries[id]
+      let input = IdentityInput(repo)
+      let key: String
+      if let previous, previous.identityInput == input { key = previous.group }
+      else { key = Analyzer.repositoryKey(repo, environmentID: id.environment); resolvedIdentities += 1 }
+      if let previous, previous.group != key {
+        groups[previous.group]?.remove(id); dirty.insert(previous.group)
+      }
+      if previous == nil || previous?.group != key || !equivalent(previous!.repo, repo) { dirty.insert(key) }
+      if previous == nil || previous?.group != key { groups[key, default: []].insert(id) }
+      if previous == nil { environmentMembers[id.environment, default: []].insert(id) }
+      if positions[id] != change.position { structural = true; positions[id] = change.position }
+      entries[id] = Entry(identityInput: input, group: key, repo: repo, status: previous?.status)
     }
     for key in dirty {
       deadlines[key] = nil
       guard let ids = groups[key], !ids.isEmpty else { groups[key] = nil; continue }
+      affected.formUnion(ids)
+      let members = Dictionary(grouping: ids, by: \.environment)
       var subset: [EnvironmentSnapshot] = []
       var identities: [UUID: [String: String]] = [:]
       for env in snapshots {
-        let repos = env.repos.filter { ids.contains(ID(environment: env.id, path: $0.path)) }
-        guard !repos.isEmpty else { continue }
-        var copy = env; copy.repos = repos; subset.append(copy)
+        guard let members = members[env.id] else { continue }
+        let repos = members.sorted { positions[$0, default: 0] < positions[$1, default: 0] }
+          .compactMap { entries[$0]?.repo }
+        var copy = env; copy.repos = SnapshotList(repos); subset.append(copy)
         identities[env.id] = Dictionary(uniqueKeysWithValues: repos.map { ($0.path, key) })
       }
       let result = Analyzer.analyze(subset, configuration: config, now: now, identities: identities)
@@ -87,17 +129,47 @@ struct IncrementalAnalyzer {
       }
     }
     if !dirty.isEmpty { revision &+= 1 }
-    var world = WorldSnapshot()
     world.environments = snapshots; world.generatedAt = now; world.analysisRevision = revision
-    for env in snapshots {
-      for repo in env.repos {
-        let id = ID(environment: env.id, path: repo.path)
-        if let status = entries[id]?.status {
-          world.clones.append(Clone(environmentID: env.id, repo: repo, status: status))
+    if structural {
+      rebuiltCloneLists += 1
+      world.clones = []; clonePositions = [:]
+      for env in snapshots {
+        for repo in env.repos {
+          let id = ID(environment: env.id, path: repo.path)
+          if let status = entries[id]?.status {
+            clonePositions[id] = world.clones.count
+            world.clones.append(Clone(environmentID: env.id, repo: repo, status: status))
+          }
+        }
+      }
+    } else {
+      for id in affected {
+        if let index = clonePositions[id], let entry = entries[id], let status = entry.status {
+          world.clones[index] = Clone(environmentID: id.environment, repo: entry.repo, status: status)
         }
       }
     }
+    let previous = snapshotRevision
+    snapshotRevision &+= 1
+    world.changes = SnapshotChanges(source: source, revision: snapshotRevision, previous: previous,
+      structural: structural, indices: structural ? [] : affected.compactMap { clonePositions[$0] }.sorted())
+    initialized = true
     return world
+  }
+
+  func peerMap(for environmentID: UUID, paths: Set<String>? = nil) -> [String: [String]] {
+    let ids = paths.map { Set($0.map { ID(environment: environmentID, path: $0) }) }
+      ?? environmentMembers[environmentID] ?? []
+    var result: [String: [String]] = [:]
+    for id in ids {
+      guard let entry = entries[id] else { continue }
+      result[id.path] = Array(Set((groups[entry.group] ?? []).compactMap { peerID -> String? in
+        guard let peer = entries[peerID]?.repo, Analyzer.sameLineOfWork(peer, entry.repo),
+              !peer.headSHA.isEmpty, peer.headSHA != entry.repo.headSHA else { return nil }
+        return peer.headSHA
+      }))
+    }
+    return result
   }
 
   private func nextChange(_ clone: Clone, configuration c: Configuration, now: Date) -> Date? {

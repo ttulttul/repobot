@@ -113,11 +113,11 @@ struct MonitorProgressTests {
     var config = Configuration()
     config.environments = [env]
     var cached = EnvironmentSnapshot(environment: env)
-    cached.repos = transport.paths.map { path in
+    cached.repos = SnapshotList(transport.paths.map { path in
       var repo = RepoSnapshot(path: path)
       repo.headSHA = "old-tip"
       return repo
-    }
+    })
     cached.checkedAt = Date(timeIntervalSince1970: 100)
     let store = StateStore(configuration: config, persistence: Persistence(directory: root),
                            cached: Analyzer.analyze([cached], configuration: config))

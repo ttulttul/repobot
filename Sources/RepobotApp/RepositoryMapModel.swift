@@ -2,6 +2,12 @@ import Foundation
 import Observation
 import RepobotCore
 
+struct RepositoryMapMachine {
+  var name: String
+  var unavailable: Bool
+  static let unknown = Self(name: "Unknown machine", unavailable: false)
+}
+
 @MainActor @Observable final class RepositoryMapRow: Identifiable {
   struct Content: Equatable {
     var repo: RepoSnapshot
@@ -15,24 +21,25 @@ import RepobotCore
   private(set) var content: Content
   private(set) var checkedAt: Date
   var groupID: String { clone.status.identity }
-  init(_ clone: Clone, world: WorldSnapshot) {
+  init(_ clone: Clone, machine: RepositoryMapMachine) {
     id = clone.id; self.clone = clone
-    content = Self.content(clone, world: world)
+    content = Self.content(clone, machine: machine)
     checkedAt = clone.repo.probedAt
   }
-  private static func content(_ clone: Clone, world: WorldSnapshot) -> Content {
+  private static func content(_ clone: Clone, machine: RepositoryMapMachine) -> Content {
     var repo = clone.repo
     // Freshness has its own observed value; a fresh check need not redraw the whole row.
     repo.probedAt = .distantPast; repo.upstreamCheckedAt = nil
     return Content(repo: repo, status: clone.status,
-                   environmentName: world.environments.first { $0.id == clone.environmentID }?.environment.name ?? "Unknown machine",
-                   unavailable: world.isUnavailable(clone), unverified: world.isUnverified(clone))
+                   environmentName: machine.name,
+                   unavailable: machine.unavailable || repo.error != nil,
+                   unverified: machine.unavailable || repo.error != nil || repo.awaitingFreshCheck == true)
   }
-  @discardableResult func update(_ clone: Clone, world: WorldSnapshot, semanticChange: Bool) -> Bool {
+  @discardableResult func update(_ clone: Clone, machine: RepositoryMapMachine, semanticChange: Bool) -> Bool {
     self.clone = clone
     if checkedAt != clone.repo.probedAt { checkedAt = clone.repo.probedAt }
     guard semanticChange else { return false }
-    let next = Self.content(clone, world: world)
+    let next = Self.content(clone, machine: machine)
     guard next != content else { return false }
     content = next
     return true
@@ -119,6 +126,9 @@ import RepobotCore
   @ObservationIgnored private var ordered: [RepositoryMapGroup] = []
   @ObservationIgnored private var revision: UInt64?
   @ObservationIgnored private var initialized = false
+  @ObservationIgnored private var snapshotSource: UUID?
+  @ObservationIgnored private var snapshotRevision: UInt64?
+  @ObservationIgnored private(set) var visitedRows = 0
   @ObservationIgnored private(set) var groupingCount = 0
   @ObservationIgnored private(set) var sortingCount = 0
   @ObservationIgnored private(set) var filteringCount = 0
@@ -126,22 +136,33 @@ import RepobotCore
 
   func update(_ world: WorldSnapshot) {
     progress.update(world)
+    let stamp = world.changes
+    if let stamp, stamp.source == snapshotSource, stamp.revision == snapshotRevision { return }
+    let incremental = initialized && stamp != nil && stamp?.source == snapshotSource
+      && stamp?.previous == snapshotRevision && stamp?.structural == false
+    let machines = Dictionary(uniqueKeysWithValues: world.environments.map {
+      ($0.id, RepositoryMapMachine(name: $0.environment.name, unavailable: $0.error != nil))
+    })
     let semanticChange = !initialized || world.analysisRevision == nil || world.analysisRevision != revision
     var structuralChange = false
     var dirty = Set<String>()
     var present = Set<String>()
-    for clone in world.clones {
-      present.insert(clone.id)
-      if let row = rows[clone.id] {
+    let candidates = incremental ? stamp!.indices.map { world.clones[$0] } : Array(world.clones)
+    visitedRows += candidates.count
+    for clone in candidates {
+      let id = clone.id
+      let machine = machines[clone.environmentID] ?? .unknown
+      present.insert(id)
+      if let row = rows[id] {
         let previousGroup = row.groupID
-        if row.update(clone, world: world, semanticChange: semanticChange) { dirty.insert(clone.status.identity) }
+        if row.update(clone, machine: machine, semanticChange: semanticChange) { dirty.insert(clone.status.identity) }
         if previousGroup != clone.status.identity { structuralChange = true; dirty.insert(previousGroup) }
       } else {
-        rows[clone.id] = RepositoryMapRow(clone, world: world)
+        rows[id] = RepositoryMapRow(clone, machine: machine)
         dirty.insert(clone.status.identity); structuralChange = true
       }
     }
-    for id in Set(rows.keys).subtracting(present) {
+    for id in incremental ? Set<String>() : Set(rows.keys).subtracting(present) {
       if let row = rows.removeValue(forKey: id) { dirty.insert(row.groupID) }
       structuralChange = true
     }
@@ -173,6 +194,7 @@ import RepobotCore
     }
     if sortNeeded || (!search.isEmpty && !dirty.isEmpty) { filter() }
     revision = world.analysisRevision; initialized = true
+    snapshotSource = stamp?.source; snapshotRevision = stamp?.revision
   }
   private func filter() {
     filteringCount += 1

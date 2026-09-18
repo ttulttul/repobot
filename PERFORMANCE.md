@@ -413,3 +413,148 @@ These checks establish lifecycle and update behavior, not a measured reduction i
 whole-app CPU. After relaunch, compare idle CPU before and after opening/closing
 the map and take another sample if usage remains elevated. The previously recorded
 local filesystem watcher creation failure remains a separate investigation.
+
+## Local watcher failure and changed-record pipeline (2026-09-17)
+
+### Watcher root cause and reproduction
+
+The local inventory supplied **441 watch paths**: the configured `~/git` root,
+214 repositories, and their Git directories. Most were descendants or duplicates
+of that root. FSEvents watches directory hierarchies recursively, but the
+`WatchRoot` flag also registers changes along each explicitly supplied path.
+Registering every descendant consumed thousands of file descriptors unnecessarily.
+
+This machine's `launchctl limit maxfiles` reports a **256** soft limit for launched
+GUI applications. The terminal/test process instead inherits **1,048,575**. This
+explains why the existing watcher passed ordinary tests yet failed in Repobot:
+
+- Before the fix, the configured-watcher diagnostic succeeded under the terminal
+  limit and failed when descriptors were restricted. A separate raw registration
+  probe explicitly set its own soft limit to 256 and reproduced the nil result.
+- A raw registration diagnostic using the original 441 paths increased open
+  descriptors from **4 to 3,639** under the higher limit.
+- After the fix, those same 441 paths reduce to **one recursive root** and the
+  configured watcher successfully registers under the 256-descriptor limit.
+- A real event-delivery test with 400 nested Git directories and an external
+  directory reached through a symlink passes using two recursive watch roots.
+  Swift's test runner can raise an inherited soft limit (observed: 256 to 2,048),
+  so the configured-watcher diagnostic enforces 256 inside the test process and
+  prints the effective limit.
+
+Registration now resolves physical paths, removes duplicates and covered
+children, and retains separate external roots. Monitor event matching uses cached
+physical paths, so `/var` versus `/private/var` and symlink spellings do not turn a
+known-repository edit into an unnecessary discovery. Newly probed external Git
+or worktree directories extend watcher coverage immediately. Dropped-event,
+root-change and mount flags request reconciliation. Watcher errors include the
+root count, descriptor limit and errno when supplied; errno after an FSEvents
+failure can reflect its cleanup, so it is not treated as the sole diagnosis.
+No process or system descriptor limits are raised.
+
+Relevant API contract: [Apple FSEventStreamCreate documentation](https://developer.apple.com/documentation/coreservices/1443980-fseventstreamcreate)
+and the installed FSEvents SDK header's `kFSEventStreamCreateFlagWatchRoot` comments.
+
+### Changed records through the monitoring pipeline
+
+Probe batches now carry exact repository paths into `StateStore.merge`.
+Environment metadata uses an empty path set; discovery reconciles membership and
+ordering. The store maintains path indexes and independently coalesces analysis
+and persistence changes as `(environment ID, repository path)` records, including
+explicit deletions and ordering positions. Failed saves retain the pending records
+for retry; baselines advance only after the SQLite transaction commits.
+
+The analyzer compares only changed inputs, uses cached membership to assemble
+only affected upstream groups, and patches the existing clone list. Full list
+reconstruction occurs for membership/order changes. Host name/error changes and
+age/configuration transitions still invalidate the groups they affect. Peer-commit
+lookup also uses cached membership and the requested probe paths instead of
+regrouping the full world before each check.
+
+Persistence reads the changed-record set directly. It no longer rebuilds and
+compares every repository dictionary to discover which four rows changed. Initial
+checkpoints, configuration reconciliation and deleted-cache recovery retain full
+rebuild paths. Environment metadata, transaction durability and fresh timestamps
+remain intact.
+
+### Validation and remaining costs
+
+The full release suite passed **84 tests across 17 suites**. New regression tests
+check bounded record visits through the store/analyzer/cache, full-analysis
+parity for upstream moves/deletions/reordering/age changes, host availability,
+coalesced discovery, configuration removals and failed delta-transaction retry.
+Thirty single-repository updates examined 30 records in analysis and 30 in
+persistence, reanalyzing the 90 copies in the affected three-copy groups.
+
+An isolated benchmark using the saved **719-copy** inventory compared full input
+scans with explicit four-record updates over 30 checkpoints:
+
+| Component | Full input scan | Explicit changed records |
+| --- | ---: | ---: |
+| Analysis CPU per update | 4.086 ms | 0.425 ms |
+| Persistence CPU per checkpoint | 3.265 ms | 1.075 ms |
+
+The changed-record path examined 120 records in each component, with only one
+initial clone-list build. Benchmark caches were temporary; the app's actual
+inventory was read only. These are component CPU measurements, not whole-app CPU
+claims. Value-type array copy-on-write, metadata encoding, SQLite connection and
+transaction overhead, event routing, and genuinely broad discovery/configuration
+changes still have costs. Measure the rebuilt app after relaunch and completion
+of startup checks before attributing any remaining idle CPU.
+
+Reproduction commands:
+
+```sh
+./scripts/swift.sh test -c release
+REPOBOT_TEST_DIAGNOSTICS=1 ./scripts/swift.sh test -c release --filter testConfiguredLocalWatcherRegistration
+REPOBOT_TEST_DIAGNOSTICS=1 REPOBOT_TEST_FD_LIMIT=256 ./scripts/swift.sh test -c release --skip-build --filter testConfiguredLocalWatcherRegistration
+REPOBOT_TEST_DIAGNOSTICS=1 ./scripts/swift.sh test -c release --skip-build --filter testChangedRecordPipelineCPU
+```
+
+## UI deltas, paged snapshots, reusable SQLite, and monitor deadlines
+
+Implemented the next four targets from the 20:52/20:53 open/closed-map samples:
+
+1. **Incremental map delivery.** World publications carry an analyzer-instance ID,
+   monotonically increasing snapshot revision, predecessor revision, structural
+   flag, and changed clone indices. The map processes only those rows, caches
+   machine lookup once per update, and skips repository work for progress-only
+   publications. Membership changes, a new analyzer instance, legacy snapshots,
+   or a missed publication trigger a complete reconciliation. This preserves
+   correctness with the stream's `bufferingNewest(1)` behavior. The UI test visits
+   three affected copies out of 240, catches up after an intentionally skipped
+   publication, then resumes three-row updates.
+2. **Bounded snapshot copying.** `SnapshotList` stores repository and clone arrays
+   in 32-record pages with value semantics. A small mutation copies only its page
+   and the page directory, not every repository's fields. Retained snapshots stay
+   unchanged, and unchanged pages remain shared. Structural removal/reordering
+   can still rebuild storage. Codable continues to use ordinary JSON arrays, so
+   persisted records, CLI output arrays, and legacy decoding remain compatible.
+3. **SQLite reuse.** The cache keeps its connection and prepared statements open,
+   performs schema/PRAGMA setup once per connection, and uses conflict updates
+   instead of deleting/replacing existing repository rows. Transactions retain
+   rollback journaling and `synchronous=FULL`. File identity checks detect deleted
+   or atomically replaced databases and recreate the connection and full baseline.
+   Tests verify reuse across 20 delta checkpoints, replacement recovery, failed
+   transactions/retries, and recovery after an interrupted external writer.
+4. **Cached scripts and deadline scheduling.** Bundled scripts are loaded once
+   through a thread-safe cache; failed reads remain retryable. Monitor timers now
+   target the next sweep, watcher retry, or remote heartbeat expiry. Heartbeats and
+   state transitions recalculate that deadline. Sweeps run separately so watchdog
+   timers remain active during long probes. Stops cancel timers and active work.
+   Battery-aware polling reassesses power/idle policy at most once a minute; event
+   monitoring does not require that periodic reassessment. Filesystem debouncing,
+   explicit refreshes, wake/network handling, and retry backoff are preserved.
+
+Validation: **91 tests in 19 suites passed**, including retained-snapshot/page
+sharing, JSON array compatibility, missed UI publications, cached-statement reuse,
+file replacement, deadline calculation and an actual idle-monitor timer test.
+The saved 719-copy benchmark (30 four-record updates) measured **0.391 ms CPU per
+incremental analysis** and **0.585 ms CPU per incremental checkpoint**. In that
+same run, full-input scans took 3.652 ms and 2.355 ms respectively. Both incremental
+components examined 120 records; the clone list was built once. These isolated
+measurements do not establish post-relaunch whole-app CPU or map-rendering cost.
+
+The release app was rebuilt and its strict code signature verified. Remaining
+costs include genuinely broad changes, snapshot page-directory copies, SQLite
+commit durability, and subprocess work; further optimization should be based on
+steady-state measurements after startup checks finish.

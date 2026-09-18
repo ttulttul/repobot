@@ -11,7 +11,7 @@ struct AgentWorkflowTests {
     try Data("def widget():\n    return 'new local feature'\n".utf8).write(to: repo.appendingPathComponent("widget.py"))
     let env = Environment(name: "Fixture Mac", kind: .local, roots: [repo.path])
     var snapshot = EnvironmentSnapshot(environment: env)
-    snapshot.repos = try await Probe.repos([repo.path], using: LocalTransport())
+    snapshot.repos = SnapshotList(try await Probe.repos([repo.path], using: LocalTransport()))
     let world = Analyzer.analyze([snapshot], configuration: Configuration())
     let group = try #require(world.repositories.first)
     let context = AgentWorkflow.context(for: group, world: world, configuration: Configuration())

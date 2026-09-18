@@ -12,31 +12,74 @@ public final class LocalWatcher: @unchecked Sendable {
   private var stream: FSEventStreamRef?
   private let handler: @Sendable (WatchEvent) -> Void
   private let queue = DispatchQueue(label: "Repobot.FSEvents")
+  let watchedRoots: [String]
+  // FSEvents watches recursively. WatchRoot consumes descriptors for explicit paths;
+  // registering every repository and .git under an already watched root exhausts the
+  // GUI application's default 256-descriptor limit.
+  static func physicalPath(_ path: String) -> String {
+    let path = (expandedPath(path) as NSString).standardizingPath
+    if let resolved = realpath(path, nil) {
+      defer { free(resolved) }
+      return String(cString: resolved)
+    }
+    // Resolve the existing ancestor of a not-yet-created repository too. Foundation
+    // may spell existing /private/var paths as /var but leave missing children alone.
+    let parent = (path as NSString).deletingLastPathComponent
+    guard !parent.isEmpty, parent != path else { return path }
+    return (physicalPath(parent) as NSString).appendingPathComponent((path as NSString).lastPathComponent)
+  }
+  static func compactRoots(_ roots: [String]) -> [String] {
+    let paths = Set(roots.filter { !$0.isEmpty }.map {
+      physicalPath($0)
+    }).sorted { $0.count == $1.count ? $0 < $1 : $0.count < $1.count }
+    var result: [String] = []
+    for path in paths where !result.contains(where: { $0 == "/" || path.hasPrefix($0 + "/") }) {
+      result.append(path)
+    }
+    return result
+  }
+  private static func failure(_ operation: String, roots: Int, code: Int32) -> RepobotError {
+    var limit = rlimit(); getrlimit(RLIMIT_NOFILE, &limit)
+    let detail = code == 0 ? "no errno supplied" : String(cString: strerror(code))
+    return .message("Could not \(operation) local filesystem watcher (\(roots) watch roots; file-descriptor limit \(limit.rlim_cur); \(detail), errno \(code))")
+  }
   public init(roots: [String], handler: @escaping @Sendable (WatchEvent) -> Void) throws {
     self.handler = handler
+    watchedRoots = Self.compactRoots(roots)
+    guard !watchedRoots.isEmpty else { throw RepobotError.message("No local filesystem watch roots configured") }
     var context = FSEventStreamContext(
       version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil,
       copyDescription: nil)
-    let callback: FSEventStreamCallback = { _, info, count, paths, _, _ in
+    let callback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
       guard let info else { return }
       let watcher = Unmanaged<LocalWatcher>.fromOpaque(info).takeUnretainedValue()
       let strings = paths.assumingMemoryBound(to: UnsafePointer<CChar>.self)
-      for i in 0..<count { watcher.handler(.changed(String(cString: strings[i]))) }
+      let rescanFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs
+        | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped
+        | kFSEventStreamEventFlagRootChanged | kFSEventStreamEventFlagMount | kFSEventStreamEventFlagUnmount)
+      for i in 0..<count {
+        if flags[i] & rescanFlags != 0 { watcher.handler(.rescan) }
+        let path = String(cString: strings[i])
+        watcher.handler(.changed(path))
+      }
     }
+    errno = 0
     stream = FSEventStreamCreate(
-      nil, callback, &context, roots.map(expandedPath) as CFArray,
+      nil, callback, &context, watchedRoots as CFArray,
       FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1,
       FSEventStreamCreateFlags(
         kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot))
     guard let stream else {
-      throw RepobotError.message("Could not create local filesystem watcher")
+      throw Self.failure("create", roots: watchedRoots.count, code: errno)
     }
     FSEventStreamSetDispatchQueue(stream, queue)
+    errno = 0
     guard FSEventStreamStart(stream) else {
+      let code = errno
       FSEventStreamInvalidate(stream)
       FSEventStreamRelease(stream)
       self.stream = nil
-      throw RepobotError.message("Could not start local filesystem watcher")
+      throw Self.failure("start", roots: watchedRoots.count, code: code)
     }
     handler(.ready)
   }

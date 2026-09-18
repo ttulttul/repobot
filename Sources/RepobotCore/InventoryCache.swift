@@ -10,6 +10,16 @@ final class InventoryCache {
   private var savedRepos: [Key: Record] = [:]
   private var savedEnvironments: [String: Data] = [:]
   private var initialized = false
+  private var database: Database?
+  private var databaseIdentity: String?
+  private var schemaReady = false
+  private(set) var openedConnections = 0
+  var preparedStatements: Int { database?.preparedStatements ?? 0 }
+  private func fileIdentity() -> String? {
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+          let inode = attributes[.systemFileNumber], let device = attributes[.systemNumber] else { return nil }
+    return "\(device):\(inode)"
+  }
   private let directory: URL
   private let encoder: JSONEncoder = {
     let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
@@ -17,6 +27,7 @@ final class InventoryCache {
     return encoder
   }()
   private(set) var encodedRepositories = 0
+  private(set) var examinedRepositories = 0
   init(directory: URL) { self.directory = directory }
   private var url: URL { directory.appendingPathComponent("inventory.sqlite") }
 
@@ -48,31 +59,46 @@ final class InventoryCache {
     }
     return records.map { record in
       var snapshot = record.snapshot
-      snapshot.repos = repositories[snapshot.id.uuidString] ?? []
+      snapshot.repos = SnapshotList(repositories[snapshot.id.uuidString] ?? [])
       return snapshot
     }
   }
 
   /// Returns false when no stored facts changed. Cached baselines advance only after COMMIT.
-  @discardableResult func save(_ snapshots: [EnvironmentSnapshot]) throws -> Bool {
-    if initialized && !FileManager.default.fileExists(atPath: url.path) {
+  @discardableResult func save(_ snapshots: [EnvironmentSnapshot], changes delta: RepositoryChanges? = nil) throws -> Bool {
+    if database != nil && databaseIdentity != fileIdentity() {
+      // Never keep writing to an unlinked/replaced SQLite inode.
+      database = nil; databaseIdentity = nil; schemaReady = false
       initialized = false; savedRepos = [:]; savedEnvironments = [:]
     }
     var environments: [String: Data] = [:]
     var repos: [Key: Record] = [:]
+    var removedRepos = Set<Key>()
+    let full = !initialized || delta == nil
     for (position, snapshot) in snapshots.enumerated() {
       let id = snapshot.id.uuidString
       var metadata = snapshot; metadata.repos = []
       // Progress is transient and must not be restored as if a probe were still running.
       metadata.checkProgress = nil
       environments[id] = try encoder.encode(EnvironmentRecord(snapshot: metadata, position: position))
-      for (index, repo) in snapshot.repos.enumerated() {
-        repos[Key(environment: id, path: repo.path)] = Record(repo: repo, position: index)
+      if full {
+        for (index, repo) in snapshot.repos.enumerated() {
+          repos[Key(environment: id, path: repo.path)] = Record(repo: repo, position: index)
+        }
       }
     }
+    if full {
+      removedRepos = Set(savedRepos.keys).subtracting(repos.keys)
+    } else if let delta {
+      for (id, change) in delta {
+        let key = Key(environment: id.environment.uuidString, path: id.path)
+        if let repo = change.repo { repos[key] = Record(repo: repo, position: change.position) }
+        else if savedRepos[key] != nil { removedRepos.insert(key) }
+      }
+    }
+    examinedRepositories += repos.count + removedRepos.count
     let changes = repos.filter { savedRepos[$0.key] != $0.value }
     let environmentChanges = environments.filter { savedEnvironments[$0.key] != $0.value }
-    let removedRepos = Set(savedRepos.keys).subtracting(repos.keys)
     let removedEnvironments = Set(savedEnvironments.keys).subtracting(environments.keys)
     if initialized && changes.isEmpty && environmentChanges.isEmpty && removedRepos.isEmpty && removedEnvironments.isEmpty {
       return false
@@ -85,17 +111,25 @@ final class InventoryCache {
       }
     }
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-    let db = try Database(url: url, writable: true)
-    let version = try db.scalar("PRAGMA user_version")
-    guard version == "0" || version == "1" else { throw RepobotError.message("Unsupported inventory cache version") }
-    try db.execute("PRAGMA journal_mode=DELETE")
-    try db.execute("PRAGMA synchronous=FULL")
+    if database == nil {
+      database = try Database(url: url, writable: true)
+      databaseIdentity = fileIdentity(); openedConnections += 1
+    }
+    let db = database!
+    if !schemaReady {
+      let version = try db.scalar("PRAGMA user_version")
+      guard version == "0" || version == "1" else { throw RepobotError.message("Unsupported inventory cache version") }
+      try db.execute("PRAGMA journal_mode=DELETE")
+      try db.execute("PRAGMA synchronous=FULL")
+    }
     try db.execute("BEGIN IMMEDIATE")
     var committed = false
     defer { if !committed { try? db.execute("ROLLBACK") } }
-    try db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    try db.execute("CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, data BLOB NOT NULL)")
-    try db.execute("CREATE TABLE IF NOT EXISTS repositories (environment TEXT NOT NULL, path TEXT NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(environment, path))")
+    if !schemaReady {
+      try db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+      try db.execute("CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, data BLOB NOT NULL)")
+      try db.execute("CREATE TABLE IF NOT EXISTS repositories (environment TEXT NOT NULL, path TEXT NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(environment, path))")
+    }
     if !initialized {
       // Replace an older process's snapshot atomically on our first checkpoint.
       try db.execute("DELETE FROM repositories")
@@ -106,18 +140,22 @@ final class InventoryCache {
     }
     for id in removedEnvironments { try db.execute("DELETE FROM environments WHERE id=?", [.text(id)]) }
     for (id, data) in environmentChanges {
-      try db.execute("INSERT OR REPLACE INTO environments VALUES (?, ?)", [.text(id), .blob(data)])
+      try db.execute("INSERT INTO environments VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", [.text(id), .blob(data)])
     }
     for (key, record) in changes {
       let data = try encoder.encode(record.repo)
-      try db.execute("INSERT OR REPLACE INTO repositories VALUES (?, ?, ?, ?)",
+      try db.execute("INSERT INTO repositories VALUES (?, ?, ?, ?) ON CONFLICT(environment, path) DO UPDATE SET position=excluded.position, data=excluded.data",
                      [.text(key.environment), .text(key.path), .integer(record.position), .blob(data)])
     }
-    try db.execute("INSERT OR REPLACE INTO metadata VALUES ('complete', '1')")
-    try db.execute("PRAGMA user_version=1")
+    if !initialized {
+      try db.execute("INSERT OR REPLACE INTO metadata VALUES ('complete', '1')")
+      try db.execute("PRAGMA user_version=1")
+    }
     try db.execute("COMMIT")
-    committed = true
-    savedRepos = repos; savedEnvironments = environments; initialized = true
+    committed = true; schemaReady = true
+    for key in removedRepos { savedRepos[key] = nil }
+    for (key, record) in changes { savedRepos[key] = record }
+    savedEnvironments = environments; initialized = true
     encodedRepositories += changes.count
     return true
   }
@@ -126,6 +164,8 @@ final class InventoryCache {
 /// Small synchronous SQLite wrapper; each connection stays on the calling actor/thread.
 private final class Database {
   private var handle: OpaquePointer?
+  private var statements: [String: OpaquePointer] = [:]
+  private(set) var preparedStatements = 0
   enum Value { case text(String), blob(Data), integer(Int) }
   init(url: URL, writable: Bool) throws {
     let flags = writable ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY
@@ -137,7 +177,10 @@ private final class Database {
     }
     sqlite3_busy_timeout(handle, 1000)
   }
-  deinit { if let handle { sqlite3_close(handle) } }
+  deinit {
+    for statement in statements.values { sqlite3_finalize(statement) }
+    if let handle { sqlite3_close(handle) }
+  }
   struct Row {
     let statement: OpaquePointer
     func string(_ column: Int32) -> String {
@@ -157,9 +200,14 @@ private final class Database {
     return result
   }
   func rows(_ sql: String, _ values: [Value] = [], body: (Row) throws -> Void) throws {
-    var statement: OpaquePointer?
-    guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw failure() }
-    defer { sqlite3_finalize(statement) }
+    let statement: OpaquePointer
+    if let cached = statements[sql] { statement = cached }
+    else {
+      var prepared: OpaquePointer?
+      guard sqlite3_prepare_v2(handle, sql, -1, &prepared, nil) == SQLITE_OK, let prepared else { throw failure() }
+      statement = prepared; statements[sql] = statement; preparedStatements += 1
+    }
+    defer { sqlite3_reset(statement); sqlite3_clear_bindings(statement) }
     let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     for (offset, value) in values.enumerated() {
       let index = Int32(offset + 1)

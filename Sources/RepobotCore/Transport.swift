@@ -314,7 +314,11 @@ public struct SSHTransport: Transport {
   }
 }
 public enum Scripts {
+  private static let cache = ScriptCache()
   public static func load(_ name: String) throws -> String {
+    try cache.load(name) { try read(name) }
+  }
+  private static func read(_ name: String) throws -> String {
     if let url = Bundle.main.resourceURL?.appendingPathComponent("RepobotCore")
       .appendingPathComponent(name), FileManager.default.fileExists(atPath: url.path)
     {
@@ -324,5 +328,18 @@ public enum Scripts {
       let url = Bundle.module.url(forResource: name, withExtension: nil, subdirectory: "Resources")
     else { throw RepobotError.message("Missing bundled script \(name)") }
     return try String(contentsOf: url, encoding: .utf8)
+  }
+}
+
+// Bundled scripts are immutable for this running binary. Failed reads are retried.
+private final class ScriptCache: @unchecked Sendable {
+  private let lock = NSLock()
+  private var values: [String: String] = [:]
+  func load(_ name: String, read: () throws -> String) rethrows -> String {
+    try lock.withLock {
+      if let value = values[name] { return value }
+      let value = try read(); values[name] = value
+      return value
+    }
   }
 }

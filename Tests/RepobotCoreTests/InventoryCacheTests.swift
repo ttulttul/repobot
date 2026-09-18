@@ -6,12 +6,12 @@ import Testing
 struct InventoryCacheTests {
   private func fixture(_ count: Int = 20) -> EnvironmentSnapshot {
     var snapshot = EnvironmentSnapshot(environment: .local)
-    snapshot.repos = (0..<count).map {
+    snapshot.repos = SnapshotList((0..<count).map {
       var repo = RepoSnapshot(path: "/repos/\($0) ' tab\tnewline\n")
       repo.branch = "main"; repo.headSHA = "tip-\($0)"
       repo.probedAt = Date(timeIntervalSince1970: 1000)
       return repo
-    }
+    })
     return snapshot
   }
   @Test func testIncrementalCheckpointsRoundTripAndDelete() throws {
@@ -53,6 +53,33 @@ struct InventoryCacheTests {
     let attributes = try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent("inventory.sqlite").path)
     #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
   }
+  @Test func testConnectionAndStatementsReusedAcrossDeltaCheckpointsAndFileReplacement() throws {
+    let root = try CoreTests().temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cache = InventoryCache(directory: root)
+    var snapshot = fixture()
+    try cache.save([snapshot])
+    let prepared = cache.preparedStatements
+    for index in 1...20 {
+      snapshot.repos[4].modified = index
+      try cache.save([snapshot], changes: [RepositoryID(environment: snapshot.id, path: snapshot.repos[4].path):
+        RepositoryChange(repo: snapshot.repos[4], position: 4)])
+    }
+    #expect(cache.openedConnections == 1)
+    #expect(cache.preparedStatements == prepared)
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+    // Atomic replacement with another valid cache must not strand writes on the old inode.
+    let replacementRoot = root.appendingPathComponent("replacement")
+    try InventoryCache(directory: replacementRoot).save([fixture(1)])
+    let destination = root.appendingPathComponent("inventory.sqlite")
+    try FileManager.default.removeItem(at: destination)
+    try FileManager.default.moveItem(at: replacementRoot.appendingPathComponent("inventory.sqlite"), to: destination)
+    snapshot.repos[4].modified = 99
+    try cache.save([snapshot], changes: [:])
+    #expect(cache.openedConnections == 2)
+    #expect(try cache.load()?.first?.repos == snapshot.repos)
+  }
+
   @Test func testLegacyMigrationUsesDatabaseAfterFirstCommit() throws {
     let root = try CoreTests().temporary()
     defer { try? FileManager.default.removeItem(at: root) }

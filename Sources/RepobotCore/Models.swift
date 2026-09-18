@@ -138,7 +138,7 @@ public struct WatcherFailure: Codable, Sendable {
 public struct EnvironmentSnapshot: Identifiable, Codable, Sendable {
   public var id: UUID { environment.id }
   public var environment: Environment
-  public var repos: [RepoSnapshot] = []
+  public var repos: SnapshotList<RepoSnapshot> = []
   public var checkedAt: Date? = nil
   public var error: String? = nil
   public var mode = "Starting"
@@ -150,11 +150,21 @@ public struct EnvironmentSnapshot: Identifiable, Codable, Sendable {
   public var lastCheckFinishedAt: Date? = nil
   public init(environment: Environment) { self.environment = environment }
 }
+/// Runtime change envelope. Consumers that miss a revision reconcile from the full
+/// snapshot, so AsyncStream buffering never silently drops repository changes.
+public struct SnapshotChanges: Codable, Sendable {
+  public var source: UUID
+  public var revision: UInt64
+  public var previous: UInt64
+  public var structural: Bool
+  public var indices: [Int]
+}
 public struct WorldSnapshot: Codable, Sendable {
   public var environments: [EnvironmentSnapshot] = []
-  public var clones: [Clone] = []
+  public var clones: SnapshotList<Clone> = []
   public var generatedAt = Date()
   public var analysisRevision: UInt64? = nil
+  public var changes: SnapshotChanges? = nil
   public init() {}
   public var repositories: [RepositoryGroup] {
     Dictionary(grouping: clones, by: { $0.status.identity }).map {

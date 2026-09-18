@@ -280,7 +280,7 @@ struct CoreTests {
     #expect(repos[0].shallow == true)
     #expect(repos[0].rootCommit != repos[1].rootCommit)
     var snapshot = EnvironmentSnapshot(environment: .local)
-    snapshot.repos = repos
+    snapshot.repos = SnapshotList(repos)
     let world = Analyzer.analyze([snapshot], configuration: Configuration())
     #expect(world.clones[0].status.peers.count == 1)
     #expect(world.clones[0].status.peers[0].text == "In sync")
@@ -506,7 +506,7 @@ struct CoreTests {
     #expect(before.count == 1)
     #expect(!before[0].dirty)
     var agentSnapshot = EnvironmentSnapshot(environment: env)
-    agentSnapshot.repos = before
+    agentSnapshot.repos = SnapshotList(before)
     let agentWorld = Analyzer.analyze([agentSnapshot], configuration: config)
     let agentContext = await AgentInspection.refresh(AgentWorkflow.context(
       for: agentWorld.repositories[0], world: agentWorld, configuration: config))

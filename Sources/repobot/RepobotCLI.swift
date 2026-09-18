@@ -47,7 +47,7 @@ import RepobotCore
       } else {
         let paths = try await Probe.discover(roots: env.roots, using: transport)
         var snapshot = EnvironmentSnapshot(environment: env)
-        snapshot.repos = try await Probe.repos(paths, upstream: upstream, using: transport)
+        snapshot.repos = SnapshotList(try await Probe.repos(paths, upstream: upstream, using: transport))
         snapshot.checkedAt = Date()
         snapshot.mode = "CLI"
         try output(Analyzer.analyze([snapshot], configuration: Configuration()))

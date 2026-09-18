@@ -43,11 +43,11 @@ public enum AgentInspection {
     }
     let snapshots = Dictionary(grouping: result.targets, by: { $0.environment.id }).values.map { targets in
       var snapshot = EnvironmentSnapshot(environment: targets[0].environment)
-      snapshot.repos = targets.map { target in
+      snapshot.repos = SnapshotList(targets.map { target in
         var repo = target.repo
         if let error = target.inspectionError { repo.error = error }
         return repo
-      }
+      })
       return snapshot
     }
     let world = Analyzer.analyze(snapshots, configuration: Configuration())

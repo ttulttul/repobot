@@ -6,13 +6,13 @@ struct IncrementalAnalyzerTests {
   private func inventory(_ now: Date) -> [EnvironmentSnapshot] {
     (0..<3).map { host in
       var snapshot = EnvironmentSnapshot(environment: Environment(name: "Host \(host)", kind: .local))
-      snapshot.repos = (0..<80).map { index in
+      snapshot.repos = SnapshotList((0..<80).map { index in
         var repo = RepoSnapshot(path: "/repos/\(index)")
         repo.originURL = "https://example.test/org/\(index).git"
         repo.branch = "main"; repo.headSHA = "tip"; repo.upstream = "origin/main"
         repo.upstreamSHA = "tip"; repo.probedAt = now
         return repo
-      }
+      })
       return snapshot
     }
   }

@@ -1,3 +1,4 @@
+import CoreServices
 import Darwin
 import Foundation
 import Testing
@@ -40,8 +41,26 @@ struct PerformanceDiagnosticsTests {
     let world = try #require(try Persistence().loadWorld(configuration: Configuration()))
     let local = try #require(world.environments.first { $0.environment.kind == .local })
     let roots = local.environment.roots + local.repos.map(\.path) + local.repos.flatMap(\.gitDirectories)
+    var originalLimit = rlimit(); getrlimit(RLIMIT_NOFILE, &originalLimit)
+    // Swift's test runner can raise an inherited soft limit; enforce this inside
+    // the opt-in diagnostic to reproduce the GUI budget exactly.
+    if let value = ProcessInfo.processInfo.environment["REPOBOT_TEST_FD_LIMIT"], let value = UInt64(value) {
+      var requested = originalLimit; requested.rlim_cur = value
+      guard setrlimit(RLIMIT_NOFILE, &requested) == 0 else { throw RepobotError.message("Could not set diagnostic descriptor limit") }
+    }
+    defer { _ = setrlimit(RLIMIT_NOFILE, &originalLimit) }
+    var limit = rlimit(); getrlimit(RLIMIT_NOFILE, &limit)
+    let descriptorsBefore = try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
+    errno = 0
+    let raw = FSEventStreamCreate(nil, { _, _, _, _, _, _ in }, nil,
+      roots.map(expandedPath) as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1,
+      FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot))
+    let code = errno
+    let descriptorsAfter = try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
+    print("Watcher raw registration: limit \(limit.rlim_cur), success \(raw != nil), errno \(code), descriptors \(descriptorsBefore) -> \(descriptorsAfter)")
+    if let raw { FSEventStreamRelease(raw) }
     let watcher = try LocalWatcher(roots: roots) { _ in }
-    print("Watcher diagnostic: registered \(roots.count) configured/inventory paths successfully in test process")
+    print("Watcher diagnostic: registered \(roots.count) configured/inventory paths as \(watcher.watchedRoots.count) recursive roots successfully in test process")
     watcher.stop()
   }
 }
@@ -78,5 +97,54 @@ extension PerformanceDiagnosticsTests {
     #expect(loaded.flatMap(\.repos) == snapshots.flatMap(\.repos))
     #expect(cache.encodedRepositories - initial == rounds * 4)
     print("Persistence checkpoint benchmark: \(cached.clones.count) copies; \(rounds) four-record updates; full JSON \(baselineCPU * 1000 / Double(rounds)) ms CPU/checkpoint; transactional incremental \(incrementalCPU * 1000 / Double(rounds)) ms CPU/checkpoint; encoded records \(cache.encodedRepositories - initial)")
+  }
+}
+
+extension PerformanceDiagnosticsTests {
+  @Test(.enabled(if: ProcessInfo.processInfo.environment["REPOBOT_TEST_DIAGNOSTICS"] == "1"))
+  func testChangedRecordPipelineCPU() throws {
+    let disk = Persistence()
+    let config = try #require(try disk.load(Configuration.self, from: "config.json"))
+    let cached = try #require(try disk.loadWorld(configuration: config))
+    var snapshots = cached.environments
+    let root = try CoreTests().temporary()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let scanRoot = root.appendingPathComponent("scan"), deltaRoot = root.appendingPathComponent("delta")
+    let scanningCache = InventoryCache(directory: scanRoot), deltaCache = InventoryCache(directory: deltaRoot)
+    var scanningAnalyzer = IncrementalAnalyzer(), deltaAnalyzer = IncrementalAnalyzer()
+    let now = Date()
+    _ = scanningAnalyzer.analyze(snapshots, configuration: config, now: now)
+    _ = deltaAnalyzer.analyze(snapshots, configuration: config, now: now)
+    try scanningCache.save(snapshots); try deltaCache.save(snapshots)
+    let analyzedBefore = deltaAnalyzer.examinedRepositories, persistedBefore = deltaCache.examinedRepositories
+    let host = try #require(snapshots.firstIndex { $0.repos.count >= 4 })
+    var scanAnalysis = 0.0, deltaAnalysis = 0.0, scanSave = 0.0, deltaSave = 0.0
+    let rounds = 30
+    for step in 0..<rounds {
+      var changes: RepositoryChanges = [:]
+      for offset in 0..<4 {
+        let index = (step * 4 + offset) % snapshots[host].repos.count
+        snapshots[host].repos[index].modified += 1
+        snapshots[host].repos[index].probedAt = now
+        let repo = snapshots[host].repos[index]
+        changes[RepositoryID(environment: snapshots[host].id, path: repo.path)] = RepositoryChange(repo: repo, position: index)
+      }
+      var start = cpuSeconds()
+      let expected = scanningAnalyzer.analyze(snapshots, configuration: config, now: now)
+      scanAnalysis += cpuSeconds() - start
+      start = cpuSeconds()
+      let actual = deltaAnalyzer.analyze(snapshots, configuration: config, now: now, changes: changes)
+      deltaAnalysis += cpuSeconds() - start
+      #expect(actual.clones.map(\.repo) == expected.clones.map(\.repo))
+      #expect(actual.clones.map(\.status) == expected.clones.map(\.status))
+      start = cpuSeconds(); try scanningCache.save(snapshots); scanSave += cpuSeconds() - start
+      start = cpuSeconds(); try deltaCache.save(snapshots, changes: changes); deltaSave += cpuSeconds() - start
+    }
+    #expect(deltaAnalyzer.examinedRepositories - analyzedBefore == rounds * 4)
+    #expect(deltaCache.examinedRepositories - persistedBefore == rounds * 4)
+    #expect(deltaAnalyzer.rebuiltCloneLists == 1)
+    #expect(try deltaCache.load()?.flatMap(\.repos) == scanningCache.load()?.flatMap(\.repos))
+    let scale = 1000 / Double(rounds)
+    print("Changed-record benchmark: \(cached.clones.count) copies, \(rounds) four-record updates; analysis scan \(scanAnalysis * scale) -> delta \(deltaAnalysis * scale) ms CPU/update; persistence scan \(scanSave * scale) -> delta \(deltaSave * scale) ms CPU/checkpoint; examined \(deltaAnalyzer.examinedRepositories - analyzedBefore) analysis and \(deltaCache.examinedRepositories - persistedBefore) persistence records; clone-list builds \(deltaAnalyzer.rebuiltCloneLists)")
   }
 }
