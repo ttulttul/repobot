@@ -35,9 +35,13 @@ public final class LocalWatcher: @unchecked Sendable {
     return (physicalPath(parent) as NSString).appendingPathComponent((path as NSString).lastPathComponent)
   }
   static func compactRoots(_ roots: [String]) -> [String] {
-    let paths = Set(roots.filter { !$0.isEmpty }.map {
-      physicalPath($0)
-    }).sorted { $0.count == $1.count ? $0 < $1 : $0.count < $1.count }
+    let nonemptyRoots: [String] = roots.filter { !$0.isEmpty }
+    let physicalPaths: [String] = nonemptyRoots.map { physicalPath($0) }
+    let uniquePaths = Set<String>(physicalPaths)
+    let paths: [String] = uniquePaths.sorted { left, right in
+      if left.count == right.count { return left < right }
+      return left.count < right.count
+    }
     var result: [String] = []
     for path in paths where !result.contains(where: { $0 == "/" || path.hasPrefix($0 + "/") }) {
       result.append(path)
