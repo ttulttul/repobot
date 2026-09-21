@@ -412,7 +412,13 @@ import UserNotifications
     }
   }
   func refreshNotificationAuthorization() async {
-    notificationAuthorization = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    // Older SDKs do not mark UNNotificationSettings as Sendable. Read the
+    // status in the callback so only the enum crosses into the main actor.
+    notificationAuthorization = await withCheckedContinuation { continuation in
+      UNUserNotificationCenter.current().getNotificationSettings { settings in
+        continuation.resume(returning: settings.authorizationStatus)
+      }
+    }
   }
   func requestNotifications() {
     Task {
