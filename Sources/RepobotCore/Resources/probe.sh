@@ -22,24 +22,26 @@ bounded_git() {
 # Scan every regular working-tree file, including ignored files. Directory mtimes
 # and symlink targets are not evidence of file edits. Git metadata may live at a
 # custom path inside the work tree, or in a shared worktree directory.
+# Timestamps stream straight into awk: a large tree's list runs to hundreds of
+# megabytes, and a file on disk outlives any probe whose client disconnects.
+# stat prints only numbers, so any other line is an error message.
 file_age() (
-    age_tmp=$(mktemp -d "${TMPDIR:-/tmp}/repobot-age.XXXXXXXX") || {
-        emit FILEAGE '' 'Could not create file scan workspace'; return
-    }
-    trap 'rm -rf "$age_tmp"' EXIT HUP INT TERM
     if stat -f %m "$PWD" >/dev/null 2>&1; then age_style=bsd; else age_style=gnu; fi
-    if [ "$age_style" = bsd ]; then
-        find "$PWD" \( -name .git -o -name .DS_Store -o -name '._*' -o -path "$g" -o -path "$common" \) -prune -o -type f -exec stat -f %m {} + >"$age_tmp/times" 2>"$age_tmp/errors"
-    else
-        find "$PWD" \( -name .git -o -name .DS_Store -o -name '._*' -o -path "$g" -o -path "$common" \) -prune -o -type f -exec stat -c %Y -- {} + >"$age_tmp/times" 2>"$age_tmp/errors"
-    fi
-    age_status=$?
-    if [ "$age_status" -ne 0 ] || [ -s "$age_tmp/errors" ]; then
+    newest=$({
+        if [ "$age_style" = bsd ]; then
+            find "$PWD" \( -name .git -o -name .DS_Store -o -name '._*' -o -path "$g" -o -path "$common" \) -prune -o -type f -exec stat -f %m {} + 2>&1
+        else
+            find "$PWD" \( -name .git -o -name .DS_Store -o -name '._*' -o -path "$g" -o -path "$common" \) -prune -o -type f -exec stat -c %Y -- {} + 2>&1
+        fi || echo 'scan failed'
+    } | awk '/^-?[0-9]+$/ {if (!seen || $0>newest) newest=$0; seen=1; next} {failed=1} END {if (failed) print "!"; else if (seen) printf "%.0f",newest}')
+    if [ "$newest" = '!' ]; then
         emit FILEAGE '' 'Some files could not be inspected; newest file age is unavailable'
     else
-        emit FILEAGE "$(awk '/^-?[0-9]+$/ {if (!seen || $0>newest) newest=$0; seen=1} END {if(seen) printf "%.0f",newest}' "$age_tmp/times")" ''
+        emit FILEAGE "$newest" ''
     fi
 )
+# Earlier versions left a scan list in repobot-age.* whenever a probe was cut off.
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'repobot-age.*' -user "$(id -u)" -mmin +60 -exec rm -rf {} + </dev/null >/dev/null 2>&1 &
 emit CLOCKSTART "$(date +%s)"
 history_fingerprint() {
     command -v openssl >/dev/null 2>&1 || return
